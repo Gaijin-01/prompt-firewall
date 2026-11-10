@@ -138,7 +138,7 @@ This is a community-built, independently maintained plugin. It is **not** an off
 
 ## Scope of the published tree
 
-This repository contains the runtime files only: `plugin.yaml`, `__init__.py`, `policy.py`, `detectors.py`, `README.md` and `LICENSE`. The `development` branch of this repository carries an automated suite of 225 unit/acceptance tests plus 13 native-integration tests that boot a real Hermes plugin manager against an isolated `HERMES_HOME` and drive the native lifecycle hooks. Those test files are not part of the published plugin tree.
+The published plugin tree (`main`) contains the runtime files only: `plugin.yaml`, `__init__.py`, `policy.py`, `detectors.py`, `README.md` and `LICENSE`. This `development` branch carries the automated suite of 225 unit/acceptance tests plus 13 native-integration tests that boot a real Hermes plugin manager against an isolated `HERMES_HOME` and drive the native lifecycle hooks. Those test files are not part of the published plugin tree.
 
 ## License
 
