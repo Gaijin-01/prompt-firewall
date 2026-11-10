@@ -1992,11 +1992,24 @@ def _is_read_operation(tool_name: str) -> bool:
     return (tool_name or "").lower() in OBSERVE_ONLY_TOOLS
 
 
+def _disables_firewall_plugin(command: str) -> bool:
+    """True when a plugin-management command switches prompt-firewall off.
+
+    The firewall protects its own plugin. A command that disables some other
+    plugin leaves the firewall running, so it is not this firewall's business:
+    the block and the message that describes it must cover the same scope.
+    """
+    low = (command or "").lower()
+    if not re.search(r"\bhermes\s+plugins\s+disable(?:\s+-y)?\b", low):
+        return False
+    return FIREWALL_PLUGIN_NAME in low
+
+
 def _is_real_control_disable(tool_name: str, targets: Sequence[str], content: str = "") -> bool:
     """True when this call would really switch a security control off."""
     name = (tool_name or "").lower()
     if name in EXEC_TOOLS:
-        if re.search(r"\bhermes\s+plugins\s+disable(?:\s+-y)?\b", content.lower()) and FIREWALL_PLUGIN_NAME in content.lower():
+        if _disables_firewall_plugin(content):
             return True
         return True
     if _observe_only(name):
@@ -2376,7 +2389,7 @@ def evaluate_tool_call(tool_name: str, args: Any) -> Verdict:
     #    phrase, not on the phrase being present at all.
     # ------------------------------------------------------------------ #
     disable_hit = _first_finding(findings, (CATEGORY_SECURITY_DISABLE,))
-    if name in EXEC_TOOLS and re.search(r"\bhermes\s+plugins\s+disable(?:\s+-y)?\b", scan_source.lower()):
+    if name in EXEC_TOOLS and _disables_firewall_plugin(scan_source):
         return Verdict(
             action="block",
             reason="security_control_disable",

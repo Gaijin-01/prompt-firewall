@@ -95,7 +95,7 @@ One family of rules is frame-gated: a phrase that switches a *generic* safety co
 Blocked and quarantined actions are appended to `<hermes_home>/logs/prompt-firewall.jsonl`:
 
 ```json
-{"timestamp": "2026-11-06T15:07:25+0200", "plugin": "prompt-firewall", "version": "1.1.3",
+{"timestamp": "2026-11-06T15:07:25+0200", "plugin": "prompt-firewall", "version": "1.1.4",
  "event": "block", "reason": "protected_write_with_injection",
  "source": "write_file:<hermes_home>/config.yaml",
  "categories": ["instruction_override"], "detail": "protected_write_with_injection"}
@@ -138,7 +138,7 @@ This is a community-built, independently maintained plugin. It is **not** an off
 
 ## Scope of the published tree
 
-This repository contains the runtime files only: `plugin.yaml`, `__init__.py`, `policy.py`, `detectors.py`, `README.md` and `LICENSE`. The upstream development repository carries an automated suite of 219 unit/acceptance tests plus 13 native-integration tests that boot a real Hermes plugin manager against an isolated `HERMES_HOME` and drive the native lifecycle hooks. Those test files are not part of the published plugin tree.
+This repository contains the runtime files only: `plugin.yaml`, `__init__.py`, `policy.py`, `detectors.py`, `README.md` and `LICENSE`. The `development` branch of this repository carries an automated suite of 225 unit/acceptance tests plus 13 native-integration tests that boot a real Hermes plugin manager against an isolated `HERMES_HOME` and drive the native lifecycle hooks. Those test files are not part of the published plugin tree.
 
 ## License
 

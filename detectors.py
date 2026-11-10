@@ -30,6 +30,7 @@ from __future__ import annotations
 import base64
 import binascii
 import re
+import bisect
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -556,6 +557,251 @@ _DIRECTIVE_FRAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: The same patterns with their trailing word boundary dropped. The published
+#: baseline evaluates its frame regexes against *truncated* sentence slices,
+#: where the slice end acts as an effective word boundary. A match of the
+#: relaxed pattern ends exactly where such a slice ends, so it identifies the
+#: matches the baseline sees and the full haystack does not.
+_GENERIC_SUBJECT_RELAXED = re.compile(
+    _GENERIC_SUBJECT_RE.pattern[:-2], re.IGNORECASE
+)
+_REPORTING_FRAME_RELAXED = re.compile(
+    _REPORTING_FRAME_RE.pattern[:-2], re.IGNORECASE
+)
+
+
+
+class _FrameIndex:
+    """Precomputed match spans so frame checks are O(log n) per finding.
+
+    The published baseline evaluates its frame regexes against *truncated*
+    sentence slices: the end of the slice acts as an effective word boundary,
+    so a token that ends exactly at the cut matches even when the haystack
+    continues with a word character. The helpers below reproduce that
+    behaviour, so the fast path decides exactly like the baseline does.
+    """
+
+    __slots__ = (
+        "haystack", "break_starts", "break_ends", "directive", "passive",
+        "search", "nominal_ends", "nominal_any", "nominal_any_ends",
+        "nominal_any_spans", "reporting", "modal_ends", "coord_ends",
+        "generic", "generic_ends", "ws_runs", "ws_ends", "modal_any",
+        "quote_positions", "relaxed_generic_start_by_end",
+        "relaxed_reporting_by_end", "glued",
+    )
+
+    #: Width of the window inspected at a slice's right edge. Every frame
+    #: pattern spans at most a few dozen characters, so a match that ends
+    #: exactly at the cut always lies inside the window.
+    _WINDOW = 64
+
+    def __init__(self, haystack: str) -> None:
+        self.haystack = haystack
+        breaks = list(_SENTENCE_BREAK_RE.finditer(haystack))
+        self.break_starts = [m.start() for m in breaks]
+        self.break_ends = [m.end() for m in breaks]
+        self.directive = [(m.start(), m.end()) for m in _DIRECTIVE_FRAME_RE.finditer(haystack)]
+        self.passive = [(m.start(), m.end()) for m in _PASSIVE_FRAME_RE.finditer(haystack)]
+        self.search = [(m.start(), m.end()) for m in _SEARCH_FRAME_RE.finditer(haystack)]
+        # For "before" checks
+        self.nominal_ends = [m.end() for m in _NOMINAL_FRAME_RE.finditer(haystack)]
+        nominal_matches = list(_NOMINAL_FRAME_ANY_RE.finditer(haystack))
+        self.nominal_any = [m.start() for m in nominal_matches]
+        self.nominal_any_ends = [m.end() for m in nominal_matches]
+        self.nominal_any_spans = [(m.start(), m.end()) for m in nominal_matches]
+        self.reporting = [(m.start(), m.end()) for m in _REPORTING_FRAME_RE.finditer(haystack)]
+        self.modal_ends = [m.end() for m in _MODAL_BEFORE_RE.finditer(haystack)]
+        self.coord_ends = [m.end() for m in _COORDINATION_TAIL_RE.finditer(haystack)]
+        # generic subjects are checked on prefixes of before, so we still may need them
+        # but for speed we can collect all generic starts
+        generic_matches = list(_GENERIC_SUBJECT_RE.finditer(haystack))
+        self.generic = [m.start() for m in generic_matches]
+        self.generic_ends = [m.end() for m in generic_matches]
+        self.ws_runs = [(m.start(), m.end()) for m in re.finditer(r"\s+", haystack)]
+        self.ws_ends = [end for _, end in self.ws_runs]
+        self.modal_any = [(m.start(), m.end()) for m in re.finditer(
+            r"(?:can|could|may|might)(?=\s)", haystack, re.IGNORECASE)]
+        # Quote parity is line-scoped. Skip each backslash + following
+        # non-newline character, matching re.sub(r"\\.", "", prefix).
+        self.quote_positions = {'"': [], "'": [], '`': []}
+        i = 0
+        while i < len(haystack):
+            c = haystack[i]
+            if c == "\\" and i + 1 < len(haystack) and haystack[i + 1] != "\n":
+                i += 2
+                continue
+            if c in self.quote_positions:
+                self.quote_positions[c].append(i)
+            i += 1
+        # Relaxed variants: a generic subject / reporting frame whose trailing
+        # word boundary is only satisfied by the end of a truncated slice.
+        relaxed_generic_start_by_end: dict = {}
+        for m in _GENERIC_SUBJECT_RELAXED.finditer(haystack):
+            relaxed_generic_start_by_end.setdefault(m.end(), m.start())
+        self.relaxed_generic_start_by_end = relaxed_generic_start_by_end
+        relaxed_reporting_by_end: dict = {}
+        for m in _REPORTING_FRAME_RELAXED.finditer(haystack):
+            relaxed_reporting_by_end.setdefault(m.end(), []).append((m.start(), m.end()))
+        self.relaxed_reporting_by_end = relaxed_reporting_by_end
+        # A reporting frame glued to a generic subject ("attackerscan to ...").
+        glued = []
+        for (rs, _re) in self.reporting:
+            gs = relaxed_generic_start_by_end.get(rs)
+            if gs is not None:
+                glued.append((rs, gs))
+        self.glued = glued
+
+    def sentence_bounds(self, start: int, end: int) -> Tuple[int, int]:
+        """Bounds of the sentence containing [start:end). Identical to original."""
+        # left: end of the last break that ends <= start
+        i = bisect.bisect_right(self.break_ends, start)
+        left = self.break_ends[i - 1] if i > 0 else 0
+        # right: start of the first break that starts >= end
+        j = bisect.bisect_left(self.break_starts, end)
+        right = self.break_starts[j] if j < len(self.break_starts) else len(self.haystack)
+        return left, right
+
+    def trailing_whitespace_start(self, pos: int) -> int:
+        i = bisect.bisect_left(self.ws_ends, pos)
+        if i < len(self.ws_runs):
+            a, b = self.ws_runs[i]
+            if a < pos <= b:
+                return a
+        return pos
+
+    # ------------------------------------------------------------------ #
+    # Slice-exact lookups
+    # ------------------------------------------------------------------ #
+
+    def _slice_has_match(self, spans, pattern, a: int, b: int) -> bool:
+        """True when *pattern* matches inside ``haystack[a:b]``.
+
+        *spans* holds the strict matches over the whole haystack. A match the
+        baseline finds only because its slice ends early is recovered by the
+        window search: ``endpos`` gives the slice its end-of-string boundary
+        back, so a token ending exactly at the cut matches.
+        """
+        if a >= b:
+            return False
+        i = bisect.bisect_left(spans, (a, -1))
+        if i < len(spans) and spans[i][1] <= b:
+            return True
+        window = b - self._WINDOW
+        if window < a:
+            window = a
+        return pattern.search(self.haystack, window, b) is not None
+
+    def _generic_before(self, left: int, pos: int) -> bool:
+        """True when a generic subject occurs inside ``haystack[left:pos]``."""
+        i = bisect.bisect_left(self.generic, left)
+        if i < len(self.generic) and self.generic_ends[i] <= pos:
+            return True
+        window = pos - self._WINDOW
+        if window < left:
+            window = left
+        return _GENERIC_SUBJECT_RE.search(self.haystack, window, pos) is not None
+
+    def has_nominal_before_at(self, left: int, pos: int) -> bool:
+        # Equivalent to NOMINAL_FRAME_RE.search(haystack[left:pos]);
+        # avoid O(n) slicing when arbitrarily long whitespace follows 'to'.
+        white_start = self.trailing_whitespace_start(pos)
+        if white_start >= pos:
+            return False
+        i = bisect.bisect_right(self.nominal_any_ends, white_start) - 1
+        return (i >= 0 and self.nominal_any_ends[i] == white_start
+                and self.nominal_any[i] >= left)
+
+    def has_modal_before_at(self, left: int, pos: int) -> bool:
+        return self._modal_before(left, pos) is not None
+
+    def _modal_before(self, left: int, pos: int):
+        """(start, end) of the hedged modal in front of the phrase, or None."""
+        white_start = self.trailing_whitespace_start(pos)
+        if white_start >= pos:
+            return None
+        i = bisect.bisect_left(self.modal_any, (white_start, -1)) - 1
+        if i >= 0 and self.modal_any[i][1] == white_start \
+                and self.modal_any[i][0] >= left:
+            return self.modal_any[i]
+        return None
+
+    def has_coord_before_at(self, left: int, pos: int) -> bool:
+        white_start = self.trailing_whitespace_start(pos)
+        if white_start >= pos:
+            return False
+        for word in ('or', 'and'):
+            at = white_start - len(word)
+            if at >= left and self.haystack[at:white_start].lower() == word:
+                return (at == left or self.haystack[at-1].isspace()
+                        or self.haystack[at-1] in ',;:')
+        return False
+
+    def inside_quotes_at(self, start: int) -> bool:
+        left = self.haystack.rfind('\n', 0, start) + 1
+        for positions in self.quote_positions.values():
+            count = bisect.bisect_left(positions, start) - bisect.bisect_left(positions, left)
+            if count & 1:
+                return True
+        return False
+
+    def has_directive_in(self, left: int, right: int) -> bool:
+        """True if a directive match lies inside ``haystack[left:right]``."""
+        return self._slice_has_match(self.directive, _DIRECTIVE_FRAME_RE, left, right)
+
+    def has_passive_from(self, from_pos: int, right: int) -> bool:
+        """True if a passive match lies inside ``haystack[from_pos:right]``."""
+        return self._slice_has_match(self.passive, _PASSIVE_FRAME_RE, from_pos, right)
+
+    def has_search_in(self, left: int, right: int) -> bool:
+        """True if a search-frame match lies inside ``haystack[left:right]``."""
+        return self._slice_has_match(self.search, _SEARCH_FRAME_RE, left, right)
+
+    def has_nominal_any_before(self, left: int, pos: int) -> bool:
+        """True if a nominal frame lies inside ``haystack[left:pos]``."""
+        return self._slice_has_match(
+            self.nominal_any_spans, _NOMINAL_FRAME_ANY_RE, left, pos
+        )
+
+    def has_reporting_with_generic_before(self, left: int, pos: int) -> bool:
+        """Reporting frame in [left:pos) with a generic subject in [left:rs)."""
+        virtual = self.relaxed_reporting_by_end.get(pos, ())
+        # A strict generic subject that fits before the reporting frame.
+        gi = bisect.bisect_left(self.generic, left)
+        if gi < len(self.generic):
+            g_end = self.generic_ends[gi]
+            if g_end <= pos:
+                ri = bisect.bisect_left(self.reporting, (g_end, -1))
+                if ri < len(self.reporting) and self.reporting[ri][0] >= left \
+                        and self.reporting[ri][1] <= pos:
+                    return True
+                for (rs, _re) in virtual:
+                    if rs >= left and rs >= g_end:
+                        return True
+        # A generic subject glued to the reporting frame ("attackerscan to").
+        for (rs, gs) in self.glued:
+            if rs < left:
+                continue
+            if rs >= pos:
+                break
+            if gs >= left:
+                return True
+        for (rs, _re) in virtual:
+            if rs < left:
+                continue
+            gs = self.relaxed_generic_start_by_end.get(rs)
+            if gs is not None and gs >= left:
+                return True
+        return False
+
+    def has_modal_with_generic_before(self, left: int, pos: int) -> bool:
+        modal = self._modal_before(left, pos)
+        if modal is None:
+            return False
+        return self._generic_before(left, modal[0])
+
+    def has_generic_before(self, left: int, pos: int) -> bool:
+        return self._generic_before(left, pos)
+
 
 def _sentence_bounds(haystack: str, start: int, end: int) -> Tuple[int, int]:
     """Bounds of the sentence that contains the ``[start:end)`` span."""
@@ -598,41 +844,62 @@ def _describes_action_in_abstract(sentence: str, before: str) -> bool:
     return False
 
 
-def _is_descriptive_frame(haystack: str, start: int, end: int) -> bool:
+def _is_descriptive_frame(
+    haystack: str,
+    start: int,
+    end: int,
+    index: Optional["_FrameIndex"] = None,
+) -> bool:
     """True when the match reads as a *description* of an action, not an order.
 
     A directive aimed at the agent always wins: when the sentence contains a
     second-person imperative, the match is an instruction even if the same
     sentence also discusses the action in the abstract.
+
+    When *index* is supplied the frame lookups are O(log n) instead of re-scanning
+    the sentence for every finding.
     """
-    left, right = _sentence_bounds(haystack, start, end)
-    sentence = haystack[left:right]
-    if _DIRECTIVE_FRAME_RE.search(sentence):
+    if index is None:
+        left, right = _sentence_bounds(haystack, start, end)
+        sentence = haystack[left:right]
+        if _DIRECTIVE_FRAME_RE.search(sentence):
+            return False
+        rel_start = max(0, start - left)
+        before = sentence[:rel_start]
+        if _describes_action_in_abstract(sentence, before):
+            return True
+        modal = _MODAL_BEFORE_RE.search(before)
+        if modal and _GENERIC_SUBJECT_RE.search(before[: modal.start()]):
+            return True
+        if _PASSIVE_FRAME_RE.search(sentence[rel_start:]):
+            return True
+        if _COORDINATION_TAIL_RE.search(before) and _NOMINAL_FRAME_ANY_RE.search(before):
+            return True
+        line_start = haystack.rfind("\n", 0, start) + 1
+        if _SEARCH_FRAME_RE.search(haystack[line_start:start]) and _inside_quotes(
+            haystack, start, end
+        ):
+            return True
         return False
-    rel_start = max(0, start - left)
-    before = sentence[:rel_start]
-    # "how to disable X" / "attackers attempt to disable X".
-    if _describes_action_in_abstract(sentence, before):
+
+    # Fast path with precomputed index
+    left, right = index.sentence_bounds(start, end)
+    if index.has_directive_in(left, right):
+        return False
+    if index.has_nominal_before_at(left, start):
         return True
-    # "attackers can disable X" - hedged modal right in front of the phrase.
-    modal = _MODAL_BEFORE_RE.search(before)
-    if modal and _GENERIC_SUBJECT_RE.search(before[: modal.start()]):
+    if index.has_reporting_with_generic_before(left, start):
         return True
-    # "... the firewall is disabled" - passive, names a blocked action.
-    if _PASSIVE_FRAME_RE.search(sentence[rel_start:]):
+    if index.has_modal_with_generic_before(left, start):
         return True
-    # "any attempt to X, or a safety-control switch-off" - a coordinated list item
-    # governed by an earlier nominal frame.
-    if _COORDINATION_TAIL_RE.search(before) and _NOMINAL_FRAME_ANY_RE.search(before):
+    if index.has_passive_from(start, right):
         return True
-    # `grep -rn "disable the firewall"` - a needle a developer is looking for.
+    if index.has_coord_before_at(left, start) and index.has_nominal_any_before(left, start):
+        return True
     line_start = haystack.rfind("\n", 0, start) + 1
-    if _SEARCH_FRAME_RE.search(haystack[line_start:start]) and _inside_quotes(
-        haystack, start, end
-    ):
+    if index.has_search_in(line_start, start) and index.inside_quotes_at(start):
         return True
     return False
-
 
 # --------------------------------------------------------------------------- #
 # Scanner
@@ -646,10 +913,12 @@ def _scan_rules(
     remap: Optional[List[int]] = None,
 ) -> None:
     """Run the rule table over *text*, appending findings to *findings*."""
+    # Pre-index frame matches once; reused for every gated finding.
+    frame_index = _FrameIndex(text) if text else None
     for pattern_id, category, regex, severity in _RULES:
         for match in regex.finditer(text):
             if pattern_id in _FRAME_GATED_RULES and _is_descriptive_frame(
-                text, match.start(), match.end()
+                text, match.start(), match.end(), frame_index
             ):
                 continue
             if remap is None:
