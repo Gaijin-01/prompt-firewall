@@ -147,14 +147,21 @@ def test_operator_scan_pages_back():
     import types as _types
 
     calls = []
+    closed = []
 
     class _FakeDB:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
         def get_messages(self, session_id, latest=False, limit=None, offset=0,
                          **kwargs):
             calls.append({"limit": limit, "offset": offset})
             if offset == 0:
                 return [{"role": "tool", "content": "x" * 50} for _ in range(limit)]
             return [{"role": "user", "content": "Проверка языка карточки"}]
+
+        def close(self):
+            closed.append(True)
 
     fake = _types.ModuleType("hermes_state")
     fake.SessionDB = _FakeDB
@@ -222,11 +229,17 @@ def _fake_session_db(rows):
     import types as _types
 
     class _FakeDB:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
         def get_messages(self, session_id, latest=False, limit=None, offset=0,
                          **kwargs):
             if offset:
                 return []
             return list(rows)
+
+        def close(self):
+            pass
 
     fake = _types.ModuleType("hermes_state")
     fake.SessionDB = _FakeDB
@@ -278,6 +291,108 @@ def test_newest_operator_message_wins():
     check("loc.newest_message_wins", detected == "ru", "detected=%s" % detected)
 
 
+def test_paginated_read_keeps_chronological_order():
+    """Regression: a paginated read must not turn the language around.
+
+    The store pages back from the newest row and returns every page in
+    chronological order, so the pages arrive newest-first. The scan has to put
+    them back into one chronological sequence: otherwise the newest operator
+    turn - the one the card follows - is the first message the window drops and
+    the card answers in the language of an older turn.
+    """
+    import types as _types
+
+    rows = ([{"role": "user", "content": "Проверка языка карточки %d" % i}
+             for i in range(6)]
+            + [{"role": "user", "content": "检查审批卡片的语言"}])
+    calls = []
+
+    class _FakeDB:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_messages(self, session_id, latest=False, limit=None, offset=0,
+                         **kwargs):
+            calls.append({"limit": limit, "offset": offset})
+            end = len(rows) - offset
+            return list(rows[max(0, end - limit):end])
+
+        def close(self):
+            pass
+
+    fake = _types.ModuleType("hermes_state")
+    fake.SessionDB = _FakeDB
+    original_page_rows = loc.PAGE_ROWS
+    loc.PAGE_ROWS = 3
+    previous = sys.modules.get("hermes_state")
+    sys.modules["hermes_state"] = fake
+    try:
+        messages = loc._operator_messages("session-key")
+        detected = loc._from_messages("session-key")
+    finally:
+        loc.PAGE_ROWS = original_page_rows
+        if previous is None:
+            sys.modules.pop("hermes_state", None)
+        else:
+            sys.modules["hermes_state"] = previous
+    chronological = messages == sorted(messages, key=lambda text: rows.index(
+        next(row for row in rows if row["content"] == text)))
+    check("loc.paginated_read_is_chronological",
+          len(calls) >= 2 and chronological
+          and messages[-1] == "检查审批卡片的语言"
+          and detected == "zh-Hans",
+          "calls=%s messages=%s detected=%s" % (calls, messages, detected))
+
+
+def test_session_store_is_read_only_and_released():
+    """Regression: a card must not take a write lock and must not leak a handle.
+
+    The card only reads the session store, so it opens it read-only, and it
+    releases the handle again - also when the read itself fails.
+    """
+    import types as _types
+
+    opened = []
+    closed = []
+
+    class _FakeDB:
+        def __init__(self, *args, **kwargs):
+            opened.append(kwargs)
+            self.raise_on_read = False
+
+        def get_messages(self, session_id, latest=False, limit=None, offset=0,
+                         **kwargs):
+            if self.raise_on_read:
+                raise RuntimeError("read failed")
+            return []
+
+        def close(self):
+            closed.append(True)
+
+    class _FailingDB(_FakeDB):
+        def __init__(self, *args, **kwargs):
+            _FakeDB.__init__(self, *args, **kwargs)
+            self.raise_on_read = True
+
+    fake = _types.ModuleType("hermes_state")
+    fake.SessionDB = _FakeDB
+    previous = sys.modules.get("hermes_state")
+    sys.modules["hermes_state"] = fake
+    try:
+        loc._operator_messages("session-key")
+        fake.SessionDB = _FailingDB
+        loc._operator_messages("session-key")
+    finally:
+        if previous is None:
+            sys.modules.pop("hermes_state", None)
+        else:
+            sys.modules["hermes_state"] = previous
+    check("loc.store_read_only_and_released",
+          len(opened) == 2 and all(kwargs.get("read_only") is True for kwargs in opened)
+          and len(closed) == 2,
+          "opened=%s closed=%s" % (opened, closed))
+
+
 TESTS = [
     test_russian_card,
     test_english_card,
@@ -290,6 +405,8 @@ TESTS = [
     test_configured_language_ignores_injected_default,
     test_compaction_summary_is_not_the_operator_voice,
     test_newest_operator_message_wins,
+    test_paginated_read_keeps_chronological_order,
+    test_session_store_is_read_only_and_released,
 ]
 
 
