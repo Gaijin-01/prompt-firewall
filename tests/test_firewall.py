@@ -48,6 +48,13 @@ sys.path.insert(0, str(HERE))
 
 import fixtures  # noqa: E402  (path set above)
 
+# The native-dispatch regression needs the Hermes Core package on the import
+# path. Mirror the path setup of ``test_native_integration.py``; override the
+# location with the HERMES_REPO environment variable.
+_HERMES_REPO = Path(os.environ.get("HERMES_REPO") or (Path.home() / ".hermes" / "hermes-agent"))
+if (_HERMES_REPO / "hermes_cli").is_dir() and str(_HERMES_REPO) not in sys.path:
+    sys.path.insert(0, str(_HERMES_REPO))
+
 detectors = pf.detectors
 policy = pf.policy
 
@@ -1527,8 +1534,6 @@ def test_audit_log_is_owner_only_and_not_symlinkable():
         pf._hermes_home = original
 
 
-if __name__ == "__main__":
-    raise SystemExit(_main())
 
 
 # --------------------------------------------------------------------------- #
@@ -2732,3 +2737,7 @@ def test_pf01_plugin_management_block_is_scoped_to_the_firewall():
         "terminal", {"command": "hermes plugins " + "disable -y " + "some-other-plugin"}
     )
     assert other.action == "allow", other
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
