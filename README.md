@@ -37,7 +37,9 @@ The plugin registers exactly three hooks, and nothing else:
 | `pre_tool_call` | evaluates a risky tool action and can return `block` or `approve` |
 | `pre_llm_call` | states the trust boundary in the operator's turn |
 
-It registers no tools, no middleware, no provider profiles and no environment variables. It reads no environment variables and no credential stores.
+It registers no tools, no middleware, no provider profiles and no environment variables. It reads no credential stores.
+
+One environment variable is read, for presentation only: `HERMES_LANGUAGE` selects the language of the approval card (section 4). It never influences a verdict.
 
 ## What it does
 
@@ -77,6 +79,41 @@ A plain, injection-free write to a protected surface is **not** blocked - it is 
 
 Injects a short notice into the operator's turn reminding the model that external content is data. It never overrides operator instructions.
 
+### 4. Approval card - what the operator is asked to approve
+
+When Hermes Core asks the operator for approval, the plugin attaches a short
+plain-language explanation of the pending action: what the command does, which paths or
+systems it touches, what data it could copy out, and what privilege it escalates to. The
+explanation is produced by a local string analysis (`explain.py`) - no LLM call, no
+network, no subprocess, no filesystem access beyond reading the operator's own session.
+
+The explanation never changes the verdict. It is attached to the `approve` message that
+Core already renders; if the explain engine fails for any reason, the card falls back to
+the unmodified firewall message, so the card can never affect enforcement.
+
+**Localized cards.** The card is rendered in the operator's language. The language is
+resolved only from trusted sources, in this order:
+
+1. `HERMES_LANGUAGE` in the environment;
+2. an explicitly written `display.language` in the Hermes configuration
+   (the merged configuration always carries an injected default, which is
+   not a choice and must not outrank the operator's own words);
+3. the operator's own last few messages in the current session;
+4. English (fallback).
+
+Untrusted content - the command under approval, tool output, `README`/`AGENTS.md`,
+downloaded documents - is never used as a language signal, and a command that asks for
+another language does not switch the card. Operator messages are read to pick the
+language; they are never stored by the plugin. Three catalogs ship with the plugin:
+English, Russian and Simplified Chinese. Code, commands, paths and technical identifiers
+are never translated.
+
+Hermes Core does not currently expose a signal for "the operator explicitly chose a
+language": the merged configuration always carries a default `display.language`,
+so a plugin cannot tell an explicit choice from the default by reading it. The
+plugin therefore reads the raw configuration file, where only what the operator
+actually wrote is present, and falls back to the operator's own messages.
+
 ## Design notes
 
 **Structure, not keywords.** A README quoting an override phrase inside a security write-up is legitimate; the same phrase aimed at the agent is not. Rules therefore require an explicit agent-directed frame (an imperative addressed to the reader, or a role/identity spoof) rather than the bare presence of a phrase.
@@ -95,7 +132,7 @@ One family of rules is frame-gated: a phrase that switches a *generic* safety co
 Blocked and quarantined actions are appended to `<hermes_home>/logs/prompt-firewall.jsonl`:
 
 ```json
-{"timestamp": "2026-11-06T15:07:25+0200", "plugin": "prompt-firewall", "version": "1.1.4",
+{"timestamp": "2026-11-06T15:07:25+0200", "plugin": "prompt-firewall", "version": "1.1.5",
  "event": "block", "reason": "protected_write_with_injection",
  "source": "write_file:<hermes_home>/config.yaml",
  "categories": ["instruction_override"], "detail": "protected_write_with_injection"}
@@ -138,7 +175,7 @@ This is a community-built, independently maintained plugin. It is **not** an off
 
 ## Scope of the published tree
 
-This repository contains the runtime files only: `plugin.yaml`, `__init__.py`, `policy.py`, `detectors.py`, `README.md` and `LICENSE`. The `development` branch of this repository carries an automated suite of 225 unit/acceptance tests plus 13 native-integration tests that boot a real Hermes plugin manager against an isolated `HERMES_HOME` and drive the native lifecycle hooks. Those test files are not part of the published plugin tree.
+This repository contains the runtime files only: `plugin.yaml`, `__init__.py`, `policy.py`, `detectors.py`, `explain.py`, `strings.py`, `locale.py`, `README.md` and `LICENSE`. The `development` branch of this repository carries the automated suite: 219 unit/acceptance tests, 13 native-integration tests that boot a real Hermes plugin manager against an isolated `HERMES_HOME` and drive the native lifecycle hooks, 46 checks for the approval-card explain engine, 12 checks for the wired approve path and 7 localization checks. Those test files are not part of the published plugin tree.
 
 ## License
 
