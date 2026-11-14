@@ -350,7 +350,7 @@ def _dev_tcp(tokens: Sequence[str]) -> bool:
 def _substitution_payloads(command: str) -> List[str]:
     """The text of every ``$( … )`` and backtick substitution in *command*.
 
-    ``echo $(rm -rf /)`` runs ``rm``: the substitution is a command, not
+    ``echo $(rm -rf DIR)`` runs ``rm``: the substitution is a command, not
     decoration, and it must be analysed like any other segment. The tokenizer
     splits ``$(`` into separate punctuation tokens, so the payloads have to be
     recovered from the raw text.
