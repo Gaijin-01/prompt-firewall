@@ -145,39 +145,58 @@ def _operator_messages(session_key: str) -> List[str]:
     the scan pages backwards over the newest rows until enough operator
     messages are found. The page count is bounded, and the scan stops as soon
     as the window is full.
+
+    The store pages back from the newest row but returns every page in
+    chronological order, so the pages arrive newest-first. They are flipped back
+    into one global chronological sequence before the window is taken: without
+    that flip the newest operator turn - the one the card has to follow - is
+    the first message the window drops.
+
+    The store is opened read-only and released deterministically. A card must
+    not take a write lock on the session store, and it must not leave a
+    connection behind.
     """
     if not session_key:
         return []
     try:
         from hermes_state import SessionDB
 
-        db = SessionDB()
+        db = SessionDB(read_only=True)
     except Exception:
         return []
-    texts: List[str] = []
-    offset = 0
-    for _ in range(MAX_PAGES):
+    pages: List[List[str]] = []
+    try:
+        offset = 0
+        for _ in range(MAX_PAGES):
+            try:
+                rows = db.get_messages(session_key, latest=True, limit=PAGE_ROWS,
+                                       offset=offset)
+            except Exception:
+                break
+            if not rows:
+                break
+            page: List[str] = []
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("role") or "") != "user":
+                    continue
+                text = _message_text(row.get("content"))
+                if not text.strip():
+                    continue
+                if text.lstrip().startswith(SYSTEM_ROW_MARKERS):
+                    continue
+                page.append(text)
+            pages.append(page)
+            if sum(len(p) for p in pages) >= MESSAGE_WINDOW or len(rows) < PAGE_ROWS:
+                break
+            offset += PAGE_ROWS
+    finally:
         try:
-            rows = db.get_messages(session_key, latest=True, limit=PAGE_ROWS,
-                                   offset=offset)
+            db.close()
         except Exception:
-            break
-        if not rows:
-            break
-        for row in rows or []:
-            if not isinstance(row, dict):
-                continue
-            if str(row.get("role") or "") != "user":
-                continue
-            text = _message_text(row.get("content"))
-            if not text.strip():
-                continue
-            if text.lstrip().startswith(SYSTEM_ROW_MARKERS):
-                continue
-            texts.append(text)
-        if len(texts) >= MESSAGE_WINDOW or len(rows) < PAGE_ROWS:
-            break
-        offset += PAGE_ROWS
+            pass
+    texts = [text for page in reversed(pages) for text in page]
     return texts[-MESSAGE_WINDOW:]
 
 
