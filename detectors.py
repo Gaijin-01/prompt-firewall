@@ -204,6 +204,30 @@ _RULES: Sequence[Tuple[str, str, re.Pattern, str]] = (
         ),
         "high",
     ),
+    # A bounded cross-language imperative grammar, not a keyword blacklist.
+    # Exclude already covered monolingual forms to avoid duplicate findings.
+    (
+        "mixed_language_override",
+        CATEGORY_INSTRUCTION_OVERRIDE,
+        re.compile(
+            r"\b(?!ignore\s+(?:all|any|the)\s+(?:previous|prior)\s+instructions\b)"
+            r"(?!\u0438\u0433\u043d\u043e\u0440\u0438\u0440\u0443\u0439\s+\u0432\u0441\u0435\s+\u043f\u0440\u0435\u0434\u044b\u0434\u0443\u0449\u0438\u0435\s+\u0438\u043d\u0441\u0442\u0440\u0443\u043a\u0446\u0438\u0438\b)"
+            r"(?:ignore|\u0438\u0433\u043d\u043e\u0440\u0438\u0440\u0443\u0439|ignora)\s+"
+            r"(?:all|any|the|\u0432\u0441\u0435|todas)\s+"
+            r"(?:previous|prior|\u043f\u0440\u0435\u0434\u044b\u0434\u0443\u0449\u0438\u0435|anteriores)\s+"
+            r"(?:instructions|\u0438\u043d\u0441\u0442\u0440\u0443\u043a\u0446\u0438\u0438|instrucciones)\b",
+            re.IGNORECASE,
+        ),
+        "high",
+    ),
+    # Coherence dependency for the lookahead above: the pure-Russian form is
+    # excluded from the mixed-language rule because this rule covers it.
+    (
+        "ignore_previous_instructions_ru",
+        CATEGORY_INSTRUCTION_OVERRIDE,
+        re.compile("\\u0438\\u0433\\u043d\\u043e\\u0440\\u0438\\u0440\\u0443\\u0439\\s+\\u0432\\u0441\\u0435\\s+\\u043f\\u0440\\u0435\\u0434\\u044b\\u0434\\u0443\\u0449\\u0438\\u0435\\s+\\u0438\\u043d\\u0441\\u0442\\u0440\\u0443\\u043a\\u0446\\u0438\\u0438", re.IGNORECASE),
+        "high",
+    ),
     (
         "new_instructions_override",
         CATEGORY_INSTRUCTION_OVERRIDE,
@@ -482,10 +506,93 @@ _RULES: Sequence[Tuple[str, str, re.Pattern, str]] = (
 )
 
 
+_ANAPHOR_OBJECT_FORMS = frozenset(
+    {
+        # English
+        "it", "them",
+        # German
+        "ihn", "ihm", "es",
+        # Russian
+        "его", "её", "их", "это", "тем",
+        # Chinese
+        "它", "他们", "那", "这",
+    }
+)
+
+_ANAPHOR_CLAUSE_FINAL_FORMS = _ANAPHOR_OBJECT_FORMS | frozenset(
+    {
+        # French
+        "le", "la", "les",
+        # Spanish / Italian / Portuguese
+        "lo", "las", "los",
+    }
+)
+
+_ANAPHOR_BOUND_FORMS = _ANAPHOR_CLAUSE_FINAL_FORMS
+
+_NOMINATIVE_SUBJECT_FORMS = frozenset(
+    {
+        # English
+        "i", "we", "he", "she", "they",
+        # French
+        "je", "tu", "il", "elle", "on", "nous", "vous", "ils", "elles",
+        # Spanish / Portuguese
+        "yo", "tú", "él", "ella", "usted", "nosotros", "vosotros",
+        "ellos", "ellas", "eu", "você", "nós",
+        # Italian
+        "io", "lui", "lei", "noi", "voi", "loro",
+        # German
+        "ich", "du", "er", "es", "sie", "wir", "ihr",
+        # Russian
+        "я", "ты", "он", "она", "мы", "вы", "оно",
+        # Chinese
+        "我", "你", "他", "她", "我们", "您",
+    }
+)
+
+_TOKEN_TRIM = ".,;:!?…«»“”„\"'()[]{}"
+
+def _clause_is_anaphoric_renewed_order(clause: str) -> bool:
+    """Whether *clause* is an anaphoric renewed order.
+
+    A renewed order refers back to a previously described action with an
+    anaphor instead of naming it again ("Fais-le.", "Fais le.", "Mach es.").
+    The test is structural rather than a per-language verb list:
+
+    * the clause is short (at most three words),
+    * it starts with no nominative subject, so it is imperative rather than
+      indicative ("Tu es un assistant." stays descriptive), and
+    * it carries an anaphoric *object*: a clitic bound to the verb
+      ("fais-le") or a clause-final anaphor right after the verb
+      ("fais le", "mach es").
+
+    The anaphor is a closed grammatical class, so the rule generalises to
+    every language whose imperative object is an anaphor instead of naming
+    the action again.
+    """
+    tokens = [tok for tok in re.split(r"\s+", clause.strip()) if tok]
+    if not tokens or len(tokens) > 3:
+        return False
+    lowered = [tok.strip(_TOKEN_TRIM).lower() for tok in tokens]
+    if lowered[0] in _NOMINATIVE_SUBJECT_FORMS:
+        return False
+    # A clitic bound to the verb ("fais-le", "mach-es").
+    for tok in lowered:
+        if "-" in tok:
+            head, sep, tail = tok.rpartition("-")
+            if head and tail in _ANAPHOR_BOUND_FORMS:
+                return True
+    # A bare verb followed by a clause-final anaphor ("fais le", "mach es").
+    # Only the two-word shape qualifies: a longer clause has room for a
+    # noun after the article-like anaphor, which would make it an article.
+    if len(lowered) == 2 and lowered[1] in _ANAPHOR_CLAUSE_FINAL_FORMS:
+        return True
+    return False
+
 #: Rules whose matches are reported only when they read as an instruction
 #: rather than as a description of one.
 _FRAME_GATED_RULES = frozenset(
-    {"disable_security_controls", "imperative_private_disclosure"}
+    {"disable_security_controls", "imperative_private_disclosure", "mixed_language_override"}
 )
 
 #: A sentence break: terminal punctuation followed by whitespace. A newline is
@@ -844,6 +951,31 @@ def _describes_action_in_abstract(sentence: str, before: str) -> bool:
     return False
 
 
+_ELLIPTICAL_FOLLOWUP_RE = re.compile(
+    r"^\s*(?:(?:now\s+)?(?:do\s+(?:it|so|that)|apply\s+(?:it|this)|"
+    r"proceed|continue|go\s+ahead|make\s+it\s+happen)|"
+    r"(?:теперь\s+)?сделай\s+это|(?:ahora\s+)?hazlo|"
+    r"jetzt\s+tu\s+es|(?:现在)?照做)\b",
+    re.IGNORECASE,
+)
+
+def _has_elliptical_followup(haystack: str, end: int) -> bool:
+    """Whether the next sentence explicitly commands the described action."""
+    boundary = _SENTENCE_BREAK_RE.search(haystack, end)
+    if not boundary:
+        return False
+    following = haystack[boundary.end() :]
+    next_boundary = _SENTENCE_BREAK_RE.search(following)
+    if next_boundary:
+        following = following[: next_boundary.start()]
+    if _ELLIPTICAL_FOLLOWUP_RE.search(following):
+        return True
+    # Structural re-arm: a short imperative clause whose object is an
+    # anaphor referring back to the described action ("Fais-le.", "Mach es.").
+    # This covers every language whose imperative takes an anaphor, instead
+    # of a finite list of imperative verbs.
+    return _clause_is_anaphoric_renewed_order(following)
+
 def _is_descriptive_frame(
     haystack: str,
     start: int,
@@ -862,7 +994,7 @@ def _is_descriptive_frame(
     if index is None:
         left, right = _sentence_bounds(haystack, start, end)
         sentence = haystack[left:right]
-        if _DIRECTIVE_FRAME_RE.search(sentence):
+        if _DIRECTIVE_FRAME_RE.search(sentence) or _has_elliptical_followup(haystack, end):
             return False
         rel_start = max(0, start - left)
         before = sentence[:rel_start]
@@ -884,7 +1016,7 @@ def _is_descriptive_frame(
 
     # Fast path with precomputed index
     left, right = index.sentence_bounds(start, end)
-    if index.has_directive_in(left, right):
+    if index.has_directive_in(left, right) or _has_elliptical_followup(haystack, end):
         return False
     if index.has_nominal_before_at(left, start):
         return True
@@ -906,6 +1038,21 @@ def _is_descriptive_frame(
 # --------------------------------------------------------------------------- #
 
 
+_MIXED_REPORTING_BEFORE_RE = re.compile(
+    r"\b(?:paper|report|documentation|research|study)\s+"
+    r"(?:reports?|discusses?|describes?|documents?|explains?)\s+"
+    r"(?:(?:that\s+)?(?:agents?|tools?|models?)\s+"
+    r"(?:sometimes|often|may|might|can)\s+|attempts?\s+to\s+)$",
+    re.IGNORECASE,
+)
+
+def _mixed_descriptive_frame(text: str, start: int, end: int, index: _FrameIndex) -> bool:
+    left, right = index.sentence_bounds(start, end)
+    if index.has_directive_in(left, right) or _has_elliptical_followup(text, end):
+        return False
+    # Bounded clause-prefix inspection, not repeated full-prefix scanning.
+    return bool(_MIXED_REPORTING_BEFORE_RE.search(text[max(left, start - 256):start]))
+
 def _scan_rules(
     text: str,
     findings: List[Finding],
@@ -917,6 +1064,10 @@ def _scan_rules(
     frame_index = _FrameIndex(text) if text else None
     for pattern_id, category, regex, severity in _RULES:
         for match in regex.finditer(text):
+            if pattern_id == "mixed_language_override" and frame_index is not None and _mixed_descriptive_frame(
+                text, match.start(), match.end(), frame_index
+            ):
+                continue
             if pattern_id in _FRAME_GATED_RULES and _is_descriptive_frame(
                 text, match.start(), match.end(), frame_index
             ):
