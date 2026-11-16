@@ -188,6 +188,12 @@ _LOG_LOCK = threading.Lock()
 
 
 def _hermes_home() -> str:
+    # An explicit HERMES_HOME always wins.  Without this, an isolated test
+    # profile that lacks hermes_cli.config.get_hermes_home silently falls
+    # back to the operator's live ~/.hermes and writes its audit trail there.
+    env_home = (os.environ.get("HERMES_HOME") or "").strip()
+    if env_home:
+        return os.path.abspath(os.path.expanduser(env_home))
     try:
         from hermes_cli.config import get_hermes_home
 

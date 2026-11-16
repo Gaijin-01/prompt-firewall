@@ -212,6 +212,7 @@ _RULES: Sequence[Tuple[str, str, re.Pattern, str]] = (
         re.compile(
             r"\b(?!ignore\s+(?:all|any|the)\s+(?:previous|prior)\s+instructions\b)"
             r"(?!\u0438\u0433\u043d\u043e\u0440\u0438\u0440\u0443\u0439\s+\u0432\u0441\u0435\s+\u043f\u0440\u0435\u0434\u044b\u0434\u0443\u0449\u0438\u0435\s+\u0438\u043d\u0441\u0442\u0440\u0443\u043a\u0446\u0438\u0438\b)"
+            r"(?!ignora\s+(?:todas?\s+)?las\s+instrucciones?\s+anteriores\b)"
             r"(?:ignore|\u0438\u0433\u043d\u043e\u0440\u0438\u0440\u0443\u0439|ignora)\s+"
             r"(?:all|any|the|\u0432\u0441\u0435|todas)\s+"
             r"(?:previous|prior|\u043f\u0440\u0435\u0434\u044b\u0434\u0443\u0449\u0438\u0435|anteriores)\s+"
@@ -226,6 +227,34 @@ _RULES: Sequence[Tuple[str, str, re.Pattern, str]] = (
         "ignore_previous_instructions_ru",
         CATEGORY_INSTRUCTION_OVERRIDE,
         re.compile("\\u0438\\u0433\\u043d\\u043e\\u0440\\u0438\\u0440\\u0443\\u0439\\s+\\u0432\\u0441\\u0435\\s+\\u043f\\u0440\\u0435\\u0434\\u044b\\u0434\\u0443\\u0449\\u0438\\u0435\\s+\\u0438\\u043d\\u0441\\u0442\\u0440\\u0443\\u043a\\u0446\\u0438\\u0438", re.IGNORECASE),
+        "high",
+    ),
+    # Monolingual forms for the languages the mixed-language grammar does not
+    # model (Spanish, Chinese, German, French).  Semantics mirror the English
+    # rule exactly, so their false-positive profile matches the accepted
+    # English behaviour instead of introducing a new one.
+    (
+        "ignore_previous_instructions_es",
+        CATEGORY_INSTRUCTION_OVERRIDE,
+        re.compile(r"ignora\s+(?:todas?\s+)?las\s+instrucciones?\s+anteriores", re.IGNORECASE),
+        "high",
+    ),
+    (
+        "ignore_previous_instructions_zh",
+        CATEGORY_INSTRUCTION_OVERRIDE,
+        re.compile("\u5ffd\u7565\u6240\u6709\u5148\u524d\u7684\u6307\u4ee4"),
+        "high",
+    ),
+    (
+        "ignore_previous_instructions_de",
+        CATEGORY_INSTRUCTION_OVERRIDE,
+        re.compile(r"ignoriere\s+(?:alle\s+)?(?:die\s+)?vorherigen\s+anweisungen", re.IGNORECASE),
+        "high",
+    ),
+    (
+        "ignore_previous_instructions_fr",
+        CATEGORY_INSTRUCTION_OVERRIDE,
+        re.compile(r"ignore\s+(?:toutes?\s+)?les\s+instructions?\s+pr(?:e|\u00e9)c(?:e|\u00e9)dentes", re.IGNORECASE),
         "high",
     ),
     (

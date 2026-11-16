@@ -33,8 +33,15 @@ BASELINE_RULE_IDS = [
     "role_spoof_system_turn"
 ]
 
-# The only rule ids the B1 port adds.
-ADDED_RULE_IDS = {"mixed_language_override", "ignore_previous_instructions_ru"}
+# The only rule ids the 1.1.6 candidate adds over the 1.1.5 baseline.
+ADDED_RULE_IDS = {
+    "mixed_language_override",
+    "ignore_previous_instructions_ru",
+    "ignore_previous_instructions_es",
+    "ignore_previous_instructions_zh",
+    "ignore_previous_instructions_de",
+    "ignore_previous_instructions_fr",
+}
 
 # Attacks the baseline already caught: the pattern id must not change.
 GOLDEN = [
