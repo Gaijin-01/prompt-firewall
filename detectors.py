@@ -613,8 +613,6 @@ def _clause_is_anaphoric_renewed_order(clause: str) -> bool:
     # request to carry it out.
     if _DISCOURSE_VERB_RE.match(lowered[0]):
         return False
-    if clause.rstrip().endswith("?"):
-        return False
     # A clitic bound to the verb ("fais-le", "mach-es").
     for tok in lowered:
         if "-" in tok:
@@ -719,8 +717,10 @@ _DESCRIPTIVE_CONTEXT_RULES = frozenset(
 
 #: A reporting frame in any of the supported languages: the phrase names an
 #: action instead of performing one.
-_MULTILINGUAL_REPORTING_BEFORE_RE = re.compile(
-    r"(?:"
+#: A reporting frame in any of the supported languages: the phrase names an
+#: action instead of performing one.
+_MULTILINGUAL_REPORTING_RE = re.compile(
+r"(?:"
     r"\b(?:paper|report|documentation|research|study|article|manual|guide|blog|post)\s+"
     r"(?:reports?|discusses?|describes?|documents?|explains?|shows?|notes?|states?|"
     r"mentions?|cites?|quotes?|presents?|summari[sz]es?)\b"
@@ -741,61 +741,162 @@ _MULTILINGUAL_REPORTING_BEFORE_RE = re.compile(
     r"\s+(?:\u043e\u0431\u044a\u044f\u0441\u043d\u044f\u0435\u0442|\u043e\u043f\u0438\u0441\u044b\u0432\u0430\u0435\u0442|"
     r"\u0443\u043a\u0430\u0437\u044b\u0432\u0430\u0435\u0442|\u0441\u043e\u043e\u0431\u0449\u0430\u0435\u0442|"
     r"\u0446\u0438\u0442\u0438\u0440\u0443\u0435\u0442|\u0430\u043d\u0430\u043b\u0438\u0437\u0438\u0440\u0443\u0435\u0442)"
-    r")[^.!?\n]{0,60}$",
+    r")",
     re.IGNORECASE,
 )
+
+#: How much text may follow a reporting frame before the matched phrase.
+_REPORTING_TAIL_MAX = 60
+
+#: How far back an artifact subject is looked for.
+_ARTIFACT_LOOKBACK = 300
 
 #: A subordinator or a coordination between the subject and the match means
 #: the subject belongs to an earlier clause, so it is not the subject of the
 #: matched verb.
 _SUBJECT_BREAK_RE = re.compile(
-    r"\b(?:que|qu[eé]|dont|who|which|that|und|oder|y|e|et|ou|\u0438|\u043b\u0438|\u0447\u0442\u043e)\b|[\uff0c\u3001\uff1b]"
+    r"\b(?:que|qu[eé]|dont|who|which|that|und|oder|y|e|et|ou|\u0438|\u043b\u0438|\u0447\u0442\u043e)\b|[\uff0c\u3001\uff1b;:]"
 )
 
-_CLAUSE_BREAKS = (".", "!", "?", "\n", "\u3002", "\uff01", "\uff1f")
+#: A command separator ends the clause that a subject can govern: "the
+#: rule ignores ...; ignore ..." holds two independent commands, and the
+#: first subject must not silence the second one.
+_CLAUSE_BREAKS = (".", "!", "?", "\n", ";", ":", "\u3002", "\uff01", "\uff1f")
+_CLAUSE_BREAK_CHARS = frozenset(_CLAUSE_BREAKS)
+
+#: A reporting frame may introduce a quote after a colon ("the article
+#: explains: ignore ..."), so the frame window survives a colon but not a
+#: semicolon and not a sentence end.
+_FRAME_BREAK_CHARS = frozenset(_CLAUSE_BREAKS) - {":"}
+
+#: The same breaks, as patterns: the boundaries are collected with one pass
+#: per text instead of one backward scan per match.
+_CLAUSE_BREAK_RE = re.compile(r"[.!?\n;:\u3002\uff01\uff1f]")
+_FRAME_BREAK_RE = re.compile(r"[.!?\n;\u3002\uff01\uff1f]")
 
 
-def _clause_prefix(text: str, start: int) -> str:
-    """The text of the clause that precedes *start*."""
-    left = 0
-    for mark in _CLAUSE_BREAKS:
-        pos = text.rfind(mark, 0, start)
-        if pos + 1 > left:
-            left = pos + 1
-    before = text[left:start]
-    return before[-300:]
+class _ContextIndex:
+    """Per-text indexes for the descriptive-context check.
+
+    The check runs for every match of the multilingual rules.  Searching the
+    text backwards for the clause boundary, for the reporting frame and for
+    the artifact subject on every match costs O(text) per match, which turns
+    a match-dense document into a quadratic scan.  Everything that does not
+    depend on the match is therefore collected once per text and looked up.
+
+    Two notions are kept apart on purpose:
+
+    * the *clause* boundary is strict - a command separator (";" or ":")
+      ends it, so a subject can never govern a verb across a separator;
+    * the *frame* window is lenient - a reporting frame may introduce a
+      quoted phrase after a colon, so it survives a colon but not a
+      semicolon and not a sentence end.
+    """
+
+    __slots__ = (
+        "text", "clause_starts", "frame_starts", "break_starts", "break_ends",
+        "frames", "frame_ends", "artifacts", "_scan_from", "_followup",
+    )
+
+    def __init__(self, text: str, since: int = 0) -> None:
+        self.text = text
+        self.clause_starts = [0] + [m.start() + 1 for m in _CLAUSE_BREAK_RE.finditer(text)]
+        self.frame_starts = [0] + [m.start() + 1 for m in _FRAME_BREAK_RE.finditer(text)]
+        breaks = list(_SENTENCE_BREAK_RE.finditer(text))
+        self.break_starts = [m.start() for m in breaks]
+        self.break_ends = [m.end() for m in breaks]
+        # Only the window in front of the first match can matter, so the two
+        # expensive scans start there.
+        scan_from = max(0, since - _ARTIFACT_LOOKBACK)
+        self.frames = [(m.start(), m.end()) for m in _MULTILINGUAL_REPORTING_RE.finditer(text, scan_from)]
+        self.frame_ends = [end for _start, end in self.frames]
+        # The artifact subjects of a language are collected on first use: a
+        # document that only carries one language never pays for the others.
+        self._scan_from = scan_from
+        self.artifacts = {}
+        self._followup = {}
+
+    @staticmethod
+    def _lookup(starts: List[int], offset: int) -> int:
+        index = bisect.bisect_right(starts, offset) - 1
+        return starts[index] if index >= 0 else 0
+
+    def has_reporting_frame(self, offset: int) -> bool:
+        """Whether a reporting frame introduces the phrase at *offset*."""
+        left = max(self._lookup(self.frame_starts, offset), offset - _ARTIFACT_LOOKBACK)
+        index = bisect.bisect_left(self.frame_ends, offset - _REPORTING_TAIL_MAX)
+        while index < len(self.frame_ends) and self.frame_ends[index] <= offset:
+            if self.frames[index][0] >= left:
+                return True
+            index += 1
+        return False
+
+    def _artifact_spans(self, language: str):
+        """The artifact subjects of one language, collected on first use."""
+        found = self.artifacts.get(language)
+        if found is None:
+            pattern = _ARTIFACT_SUBJECT_BY_LANGUAGE.get(language)
+            if pattern is None:
+                found = ((), ())
+            else:
+                spans = [(m.start(), m.end()) for m in pattern.finditer(self.text, self._scan_from)]
+                found = (spans, [start for start, _end in spans])
+            self.artifacts[language] = found
+        return found
+
+    def artifact_subject_governs(self, offset: int, languages: Iterable[str]) -> bool:
+        """Whether the matched verb is the predicate of an artifact subject."""
+        left = max(self._lookup(self.clause_starts, offset), offset - _ARTIFACT_LOOKBACK)
+        for language in languages:
+            spans, starts = self._artifact_spans(language)
+            if not spans:
+                continue
+            index = bisect.bisect_right(starts, offset) - 1
+            if index < 0:
+                continue
+            start, end = spans[index]
+            if start < left:
+                continue
+            if not _SUBJECT_BREAK_RE.search(self.text[end:offset]):
+                return True
+        return False
+
+    def has_elliptical_followup(self, end: int) -> bool:
+        """Whether the next sentence commands the described action.
+
+        The answer depends on the sentence that follows, not on the match
+        inside the current sentence, so it is computed once per sentence.
+        """
+        index = bisect.bisect_left(self.break_starts, end)
+        if index >= len(self.break_starts):
+            return False
+        cached = self._followup.get(index)
+        if cached is None:
+            stop = self.break_starts[index + 1] if index + 1 < len(self.break_starts) else len(self.text)
+            following = self.text[self.break_ends[index]:stop]
+            cached = bool(_ELLIPTICAL_FOLLOWUP_RE.search(following)) or _clause_is_anaphoric_renewed_order(
+                following
+            )
+            self._followup[index] = cached
+        return cached
 
 
-def _artifact_subject_governs(before: str, languages: Iterable[str]) -> bool:
-    """Whether the matched verb is the predicate of an artifact subject."""
-    for language in languages:
-        pattern = _ARTIFACT_SUBJECT_BY_LANGUAGE.get(language)
-        if pattern is None:
-            continue
-        found = list(pattern.finditer(before))
-        if not found:
-            continue
-        last = found[-1]
-        if not _SUBJECT_BREAK_RE.search(before[last.end() :]):
-            return True
-    return False
-
-
-def _is_descriptive_context(text: str, start: int, end: int, pattern_id: str) -> bool:
+def _is_descriptive_context(
+    index: "_ContextIndex", text: str, start: int, end: int, pattern_id: str
+) -> bool:
     """Whether the match reads as a description of an action, not as an order.
 
     A directive that follows the match always wins: when the next sentence
     renews the order ("Fais-le."), the phrase is part of an attack even if the
     clause itself looks descriptive.
     """
-    if _has_elliptical_followup(text, end):
+    if index.has_elliptical_followup(end):
         return False
-    before = _clause_prefix(text, start)
-    if _MULTILINGUAL_REPORTING_BEFORE_RE.search(before):
+    if index.has_reporting_frame(start):
         return True
     language = _RULE_LANGUAGE.get(pattern_id)
     languages = (language,) if language else tuple(_ARTIFACT_SUBJECT_BY_LANGUAGE)
-    return _artifact_subject_governs(before, languages)
+    return index.artifact_subject_governs(start, languages)
 
 
 #: Verbs that ask about an action instead of ordering it.  A clause built on
@@ -1286,16 +1387,22 @@ def _scan_rules(
     """Run the rule table over *text*, appending findings to *findings*."""
     # Pre-index frame matches once; reused for every gated finding.
     frame_index = _FrameIndex(text) if text else None
+    # Built on the first match that needs it: a document without such a
+    # match pays nothing for the context analysis.
+    context_index = None
     for pattern_id, category, regex, severity in _RULES:
         for match in regex.finditer(text):
             if pattern_id == "mixed_language_override" and frame_index is not None and _mixed_descriptive_frame(
                 text, match.start(), match.end(), frame_index
             ):
                 continue
-            if pattern_id in _DESCRIPTIVE_CONTEXT_RULES and _is_descriptive_context(
-                text, match.start(), match.end(), pattern_id
-            ):
-                continue
+            if pattern_id in _DESCRIPTIVE_CONTEXT_RULES:
+                if context_index is None:
+                    context_index = _ContextIndex(text, match.start())
+                if _is_descriptive_context(
+                    context_index, text, match.start(), match.end(), pattern_id
+                ):
+                    continue
             if pattern_id in _FRAME_GATED_RULES and _is_descriptive_frame(
                 text, match.start(), match.end(), frame_index
             ):
