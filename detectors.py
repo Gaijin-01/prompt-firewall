@@ -667,7 +667,9 @@ _ARTIFACT_SUBJECT_BY_LANGUAGE = {
         re.IGNORECASE,
     ),
     "fr": re.compile(
-        r"\b(?:la|le|les|une|un|cette|ce|l')\s+"
+        # The elision binds to the word: "l'article" has no space, so the
+        # apostrophe may be followed by whitespace or by nothing at all.
+        r"\b(?:(?:la|le|les|une|un|cette|ce)\s+|l['\u2019]\s*)"
         r"(?:\w+[,\s]+){0,2}?"
         r"(?:r[eè]gle|r[eè]gles|syst[eè]me|syst[eè]mes|mod[eè]le|mod[eè]les|"
         r"d[eé]tecteur|d[eé]tecteurs|filtre|filtres|article|articles|"
@@ -728,7 +730,7 @@ r"(?:"
     r"(?:art[ií]culo|documento|estudio|investigaci[oó]n|paper|manual|gu[ií]a|blog|entrada)\s+"
     r"(?:explica|describe|documenta|indica|menciona|se[nñ]ala|reporta|recuerda|cita|"
     r"analiza|estudia|publica|presenta)\b"
-    r"|\b(?:l'|le|la|les|un|une)\s+"
+    r"|\b(?:(?:le|la|les|un|une)\s+|l['\u2019]\s*)"
     r"(?:article|document|[eé]tude|recherche|rapport|manuel|guide)\s+"
     r"(?:explique|d[ée]crit|documente|indique|mentionne|rapporte|pr[ée]cise|cite|analyse|[eé]tudie)\b"
     r"|\b(?:der|die|das|ein|eine)\s+"
@@ -798,16 +800,19 @@ class _ContextIndex:
         "frames", "frame_ends", "artifacts", "_scan_from", "_followup",
     )
 
-    def __init__(self, text: str, since: int = 0) -> None:
+    def __init__(self, text: str) -> None:
         self.text = text
         self.clause_starts = [0] + [m.start() + 1 for m in _CLAUSE_BREAK_RE.finditer(text)]
         self.frame_starts = [0] + [m.start() + 1 for m in _FRAME_BREAK_RE.finditer(text)]
         breaks = list(_SENTENCE_BREAK_RE.finditer(text))
         self.break_starts = [m.start() for m in breaks]
         self.break_ends = [m.end() for m in breaks]
-        # Only the window in front of the first match can matter, so the two
-        # expensive scans start there.
-        scan_from = max(0, since - _ARTIFACT_LOOKBACK)
+        # The index covers the WHOLE text.  The matches are visited in rule
+        # order, not in the order of their offsets, so a window that started
+        # at the first match would hide the context in front of an earlier
+        # match of another rule.  What the window rules exclude is filtered
+        # again at lookup time, so the extra data changes no decision.
+        scan_from = 0
         self.frames = [(m.start(), m.end()) for m in _MULTILINGUAL_REPORTING_RE.finditer(text, scan_from)]
         self.frame_ends = [end for _start, end in self.frames]
         # The artifact subjects of a language are collected on first use: a
@@ -1398,7 +1403,7 @@ def _scan_rules(
                 continue
             if pattern_id in _DESCRIPTIVE_CONTEXT_RULES:
                 if context_index is None:
-                    context_index = _ContextIndex(text, match.start())
+                    context_index = _ContextIndex(text)
                 if _is_descriptive_context(
                     context_index, text, match.start(), match.end(), pattern_id
                 ):
