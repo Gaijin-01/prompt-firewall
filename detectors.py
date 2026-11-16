@@ -605,6 +605,16 @@ def _clause_is_anaphoric_renewed_order(clause: str) -> bool:
     lowered = [tok.strip(_TOKEN_TRIM).lower() for tok in tokens]
     if lowered[0] in _NOMINATIVE_SUBJECT_FORMS:
         return False
+    # A clause that asks *about* the action does not renew the order:
+    # "Explain it.", "Discuss it.", "Summarize it." discuss the described
+    # instruction instead of ordering it.  Without this test any two-word
+    # clause with a clause-final anaphor re-armed an instruction, which made
+    # a request to analyse a documented attack indistinguishable from a
+    # request to carry it out.
+    if _DISCOURSE_VERB_RE.match(lowered[0]):
+        return False
+    if clause.rstrip().endswith("?"):
+        return False
     # A clitic bound to the verb ("fais-le", "mach-es").
     for tok in lowered:
         if "-" in tok:
@@ -622,6 +632,191 @@ def _clause_is_anaphoric_renewed_order(clause: str) -> bool:
 #: rather than as a description of one.
 _FRAME_GATED_RULES = frozenset(
     {"disable_security_controls", "imperative_private_disclosure", "mixed_language_override"}
+)
+
+# --------------------------------------------------------------------------- #
+# Descriptive context for the multilingual rules
+# --------------------------------------------------------------------------- #
+#
+# The English rule needs no help here: "ignores" (third person singular) does
+# not match the imperative verb in the pattern, so descriptive English prose
+# never reaches the rule at all.  Spanish, French and Chinese have one form
+# for both readings ("ignora", "ignore"), and German differs only by a
+# suffix, so for those languages the subject is the only reliable signal that
+# the phrase describes an action instead of ordering it.
+#
+# Adding the new rule ids to _FRAME_GATED_RULES is not enough: that machinery
+# is written in English.  Two language-aware checks are used instead:
+#
+#   1. a reporting frame ("the paper explains that ...", "el articulo
+#      explica que ...") - the phrase names an action instead of performing
+#      one, in the language the rule covers;
+#   2. an artifact subject ("the rule ignores ...") - the matched verb is the
+#      predicate of a subject that names the described mechanism.
+#
+# The artifact list is deliberately restricted to artifacts of the described
+# mechanism (rule, system, model, detector, filter, article, study).  A
+# person or an agent is left out on purpose: "the attacker ignores ..."
+# still names an actor and must stay reported.
+
+_ARTIFACT_SUBJECT_BY_LANGUAGE = {
+    "es": re.compile(
+        r"\b(?:la|el|las|los|una|un|esta|este|esa|ese)\s+"
+        r"(?:\w+[,\s]+){0,2}?"
+        r"(?:regla|reglas|sistema|sistemas|modelo|modelos|detector|detectores|"
+        r"filtro|filtros|art[ií]culo|art[ií]culos|documentaci[oó]n|manual|"
+        r"estudio|estudios|paper)",
+        re.IGNORECASE,
+    ),
+    "fr": re.compile(
+        r"\b(?:la|le|les|une|un|cette|ce|l')\s+"
+        r"(?:\w+[,\s]+){0,2}?"
+        r"(?:r[eè]gle|r[eè]gles|syst[eè]me|syst[eè]mes|mod[eè]le|mod[eè]les|"
+        r"d[eé]tecteur|d[eé]tecteurs|filtre|filtres|article|articles|"
+        r"documentation|manuel|[eé]tude|[eé]tudes|paper)",
+        re.IGNORECASE,
+    ),
+    "de": re.compile(
+        r"\b(?:die|der|das|den|dem|des|ein|eine|dieser|dieses|diese)\s+"
+        r"(?:\w+[,\s]+){0,2}?"
+        r"(?:regel|regeln|system|systeme|modell|modelle|detektor|detektoren|"
+        r"filter|artikel|dokumentation|handbuch|studie|paper)",
+        re.IGNORECASE,
+    ),
+    "zh": re.compile(
+        r"(?:\u89c4\u5219|\u7cfb\u7edf|\u6a21\u578b|\u68c0\u6d4b\u5668|"
+        r"\u8fc7\u6ee4\u5668|\u6587\u7ae0|\u6587\u6863|\u624b\u518c|"
+        r"\u7814\u7a76|\u8bba\u6587)"
+    ),
+    "ru": re.compile(
+        r"(?:\u043f\u0440\u0430\u0432\u0438\u043b\u043e|\u0441\u0438\u0441\u0442\u0435\u043c\u0430|"
+        r"\u043c\u043e\u0434\u0435\u043b\u0438|\u0434\u0435\u0442\u0435\u043a\u0442\u043e\u0440|"
+        r"\u0444\u0438\u043b\u044c\u0442\u0440|\u0441\u0442\u0430\u0442\u044c\u044f|"
+        r"\u0440\u0443\u043a\u043e\u0432\u043e\u0434\u0441\u0442\u0432\u043e|\u0438\u0441\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u043d\u0438\u0435)"
+    ),
+}
+
+#: Which language each multilingual rule reads its subject in.
+_RULE_LANGUAGE = {
+    "ignore_previous_instructions_es": "es",
+    "ignore_previous_instructions_fr": "fr",
+    "ignore_previous_instructions_de": "de",
+    "ignore_previous_instructions_zh": "zh",
+    "ignore_previous_instructions_ru": "ru",
+}
+
+#: Rules that may be a description rather than an order, in the languages they
+#: cover.  The mixed-language rule can carry a subject in any of them.
+_DESCRIPTIVE_CONTEXT_RULES = frozenset(
+    {
+        "mixed_language_override",
+        "ignore_previous_instructions_es",
+        "ignore_previous_instructions_fr",
+        "ignore_previous_instructions_de",
+        "ignore_previous_instructions_zh",
+    }
+)
+
+#: A reporting frame in any of the supported languages: the phrase names an
+#: action instead of performing one.
+_MULTILINGUAL_REPORTING_BEFORE_RE = re.compile(
+    r"(?:"
+    r"\b(?:paper|report|documentation|research|study|article|manual|guide|blog|post)\s+"
+    r"(?:reports?|discusses?|describes?|documents?|explains?|shows?|notes?|states?|"
+    r"mentions?|cites?|quotes?|presents?|summari[sz]es?)\b"
+    r"|\b(?:el|la|los|las|un|una)\s+"
+    r"(?:art[ií]culo|documento|estudio|investigaci[oó]n|paper|manual|gu[ií]a|blog|entrada)\s+"
+    r"(?:explica|describe|documenta|indica|menciona|se[nñ]ala|reporta|recuerda|cita|"
+    r"analiza|estudia|publica|presenta)\b"
+    r"|\b(?:l'|le|la|les|un|une)\s+"
+    r"(?:article|document|[eé]tude|recherche|rapport|manuel|guide)\s+"
+    r"(?:explique|d[ée]crit|documente|indique|mentionne|rapporte|pr[ée]cise|cite|analyse|[eé]tudie)\b"
+    r"|\b(?:der|die|das|ein|eine)\s+"
+    r"(?:artikel|dokument|studi|bericht|handbuch|leitfaden)\s+"
+    r"(?:erkl[äa]rt|beschreibt|dokumentiert|weist\s+hin|nennt|berichtet|zitiert|analysiert|untersucht)\b"
+    r"|(?:\u6587\u7ae0|\u8bba\u6587|\u7814\u7a76|\u62a5\u544a|\u6587\u6863|\u624b\u518c)"
+    r"\s*(?:\u8bf4\u660e|\u63cf\u8ff0|\u6307\u51fa|\u63d0\u5230|\u8868\u660e|\u5199\u9053|\u4ee4\u4eba|\u4ecb\u7ecd|\u5f15\u8ff0)"
+    r"|(?:\u0441\u0442\u0430\u0442\u044c\u044f|\u0438\u0441\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u043d\u0438\u0435|"
+    r"\u0434\u043e\u043a\u0443\u043c\u0435\u043d\u0442|\u043e\u0442\u0447[её]\u0442)"
+    r"\s+(?:\u043e\u0431\u044a\u044f\u0441\u043d\u044f\u0435\u0442|\u043e\u043f\u0438\u0441\u044b\u0432\u0430\u0435\u0442|"
+    r"\u0443\u043a\u0430\u0437\u044b\u0432\u0430\u0435\u0442|\u0441\u043e\u043e\u0431\u0449\u0430\u0435\u0442|"
+    r"\u0446\u0438\u0442\u0438\u0440\u0443\u0435\u0442|\u0430\u043d\u0430\u043b\u0438\u0437\u0438\u0440\u0443\u0435\u0442)"
+    r")[^.!?\n]{0,60}$",
+    re.IGNORECASE,
+)
+
+#: A subordinator or a coordination between the subject and the match means
+#: the subject belongs to an earlier clause, so it is not the subject of the
+#: matched verb.
+_SUBJECT_BREAK_RE = re.compile(
+    r"\b(?:que|qu[eé]|dont|who|which|that|und|oder|y|e|et|ou|\u0438|\u043b\u0438|\u0447\u0442\u043e)\b|[\uff0c\u3001\uff1b]"
+)
+
+_CLAUSE_BREAKS = (".", "!", "?", "\n", "\u3002", "\uff01", "\uff1f")
+
+
+def _clause_prefix(text: str, start: int) -> str:
+    """The text of the clause that precedes *start*."""
+    left = 0
+    for mark in _CLAUSE_BREAKS:
+        pos = text.rfind(mark, 0, start)
+        if pos + 1 > left:
+            left = pos + 1
+    before = text[left:start]
+    return before[-300:]
+
+
+def _artifact_subject_governs(before: str, languages: Iterable[str]) -> bool:
+    """Whether the matched verb is the predicate of an artifact subject."""
+    for language in languages:
+        pattern = _ARTIFACT_SUBJECT_BY_LANGUAGE.get(language)
+        if pattern is None:
+            continue
+        found = list(pattern.finditer(before))
+        if not found:
+            continue
+        last = found[-1]
+        if not _SUBJECT_BREAK_RE.search(before[last.end() :]):
+            return True
+    return False
+
+
+def _is_descriptive_context(text: str, start: int, end: int, pattern_id: str) -> bool:
+    """Whether the match reads as a description of an action, not as an order.
+
+    A directive that follows the match always wins: when the next sentence
+    renews the order ("Fais-le."), the phrase is part of an attack even if the
+    clause itself looks descriptive.
+    """
+    if _has_elliptical_followup(text, end):
+        return False
+    before = _clause_prefix(text, start)
+    if _MULTILINGUAL_REPORTING_BEFORE_RE.search(before):
+        return True
+    language = _RULE_LANGUAGE.get(pattern_id)
+    languages = (language,) if language else tuple(_ARTIFACT_SUBJECT_BY_LANGUAGE)
+    return _artifact_subject_governs(before, languages)
+
+
+#: Verbs that ask about an action instead of ordering it.  A clause built on
+#: one of them discusses the anaphor, so it must not re-arm an instruction.
+#: The stems cover the languages of the anaphor forms below.
+_DISCOURSE_VERB_RE = re.compile(
+    r"explain\w*|discuss\w*|summari[sz]\w*|describ\w*|analy[sz]\w*|review\w*|"
+    r"translat\w*|quot\w*|comment\w*|evaluat\w*|examin\w*|consider\w*|"
+    r"think\w*|mention\w*|defin\w*|understand\w*|compar\w*|critic\w*|"
+    r"interpret\w*|stud\w*|list\w*|"
+    r"expliqu\w*|discut\w*|r[ée]sum\w*|r[ée]cit\w*|d[ée]cr\w*|analys\w*|"
+    r"tradui\w*|[ée]valuat?\w*|examin\w*|consid[ée]r?\w*|pens\w*|"
+    r"explic\w*|resum\w*|describ\w*|analiz\w*|traduc\w*|"
+    r"erkl[äa]r\w*|diskutier\w*|zusammenfass\w*|beschreib\w*|analysier\w*|"
+    r"[üu]bersetz\w*|kommentier\w*|bewert\w*|betracht\w*|"
+    r"\u043e\u0431\u044a\u044f\u0441\u043d\u0438\u0442\u044c|\u043e\u0431\u0441\u0443\u0434\u0438\u0442\u044c|"
+    r"\u043f\u0435\u0440\u0435\u0441\u043a\u0430\u0437\u0430\u0442\u044c|\u043e\u043f\u0438\u0441\u0430\u0442\u044c|"
+    r"\u043f\u0440\u043e\u0430\u043d\u0430\u043b\u0438\u0437\u0438\u0440\u043e\u0432\u0430\u0442\u044c|\u043f\u0435\u0440\u0435\u0432\u0435\u0441\u0442\u0438|"
+    r"\u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c|\u043e\u0446\u0435\u043d\u0438\u0432\u0430\u0442\u044c|"
+    r"\u89e3\u91ca|\u8bf4\u660e|\u8ba8\u8bba|\u603b\u7ed3|\u6982\u8ff0|\u63cf\u8ff0|\u5206\u6790|\u7ffb\u8bd1|\u8bc4\u8bba",
+    re.IGNORECASE,
 )
 
 #: A sentence break: terminal punctuation followed by whitespace. A newline is
@@ -1095,6 +1290,10 @@ def _scan_rules(
         for match in regex.finditer(text):
             if pattern_id == "mixed_language_override" and frame_index is not None and _mixed_descriptive_frame(
                 text, match.start(), match.end(), frame_index
+            ):
+                continue
+            if pattern_id in _DESCRIPTIVE_CONTEXT_RULES and _is_descriptive_context(
+                text, match.start(), match.end(), pattern_id
             ):
                 continue
             if pattern_id in _FRAME_GATED_RULES and _is_descriptive_frame(
