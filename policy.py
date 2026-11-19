@@ -130,6 +130,13 @@ CREDENTIAL_BASENAMES: Tuple[str, ...] = (
     ".netrc",
     ".npmrc",
     "config.json",
+    # G1/F2: the AWS shared-credentials file is named exactly ``credentials``
+    # (no extension). It is secret-bearing only inside a known credential
+    # directory (``~/.aws/`` and siblings in CREDENTIAL_DIR_MARKERS), so a
+    # project file that merely happens to be named ``credentials`` is NOT
+    # reclassified. This closes the gap where ``~/.aws/credentials`` fell
+    # through to a generic protected write instead of a credential verdict.
+    "credentials",
     # Shell startup and MCP / editor task surfaces: a write here is a
     # persistence risk even though the file is not a credential itself.
     ".bashrc",
@@ -1245,6 +1252,9 @@ def extract_patch_targets(args: Any) -> List[str]:
 # --------------------------------------------------------------------------- #
 
 #: Verbs that only prefix another command.
+#: The name part of a shell environment assignment (``NAME=value``).
+_ENV_ASSIGNMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 _SHELL_WRAPPER_VERBS: Tuple[str, ...] = (
     "sudo",
     "doas",
@@ -1373,10 +1383,33 @@ def _strip_leading_options(tokens: Sequence[str], value_options: Sequence[str]) 
     return list(tokens[index:])
 
 
+def _strip_env_assignments(tokens: Sequence[str]) -> List[str]:
+    """Drop the ``NAME=value`` environment assignments that precede a command.
+
+    ``FOO=1 rm /path`` runs ``rm``; the assignment only sets an environment
+    variable for it. Treating the assignment as the command word hides the
+    write verb from the resolver entirely.
+    """
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        name, sep, _value = token.partition("=")
+        if not sep or not name or not _ENV_ASSIGNMENT_NAME_RE.match(name):
+            break
+        index += 1
+    return list(tokens[index:])
+
+
 def _shell_verb(segment: Sequence[str]) -> Tuple[str, List[str]]:
     """The effective command of a segment and its arguments."""
     tokens = list(segment)
     while tokens:
+        # An environment assignment may precede the command word, and the
+        # command word may itself be a wrapper (``env FOO=1 rm ...``).
+        stripped = _strip_env_assignments(tokens)
+        if stripped != tokens:
+            tokens = stripped
+            continue
         base = os.path.basename(tokens[0])
         if base not in _SHELL_WRAPPER_VERBS:
             break
@@ -1651,6 +1684,532 @@ def _shell_write_destinations(command: str, depth: int = 0) -> List[str]:
     return destinations
 
 
+#: Commands that change the filesystem. A command from this set that names a
+#: protected surface is a write attempt even when its destination cannot be
+#: resolved statically.
+_SHELL_WRITE_VERBS: Tuple[str, ...] = (
+    "tee", "sed", "perl", "cp", "mv", "ln", "install", "rm", "rmdir", "mkdir",
+    "touch", "chmod", "chown", "truncate", "dd", "curl", "wget", "tar", "unzip",
+    "rsync", "rclone", "scp", "git", "pip", "pip3", "npm", "sponge", "xargs",
+    "find", "python", "python2", "python3", "pypy", "sh", "bash", "zsh", "dash",
+    "ksh",
+)
+
+#: Sub-commands that only read state. A command from this set is not a
+#: write attempt, however its verb is named.
+_READ_ONLY_SUBCOMMANDS: Dict[str, Tuple[str, ...]] = {
+    "git": (
+        "status", "log", "diff", "show", "blame", "describe", "rev-parse",
+        "ls-files", "ls-remote", "ls-tree", "shortlog", "reflog", "cat-file",
+        "grep", "whatchanged", "annotate", "show-ref", "for-each-ref",
+    ),
+    # ``pip config`` is NOT listed here: only ``pip config list``/``get``
+    # read; ``pip config set``/``unset`` mutate a configuration file.
+    "pip": ("download", "list", "show", "freeze", "inspect"),
+    "pip3": ("download", "list", "show", "freeze", "inspect"),
+    "npm": ("view", "ls", "list", "outdated", "audit", "ping", "whoami"),
+    "tar": (),
+}
+
+#: Option values for the verbs above, so an option's argument is never
+#: mistaken for a path.
+_SHELL_WRITE_VERB_OPTIONS: Dict[str, Tuple[str, ...]] = {
+    "mkdir": ("-m", "--mode"),
+    "touch": ("-d", "--date", "-t", "--time", "-r", "--reference"),
+    "chmod": ("--reference",),
+    "chown": ("--reference",),
+    "rsync": (
+        "--temp-dir", "--backup-dir", "--rsync-path", "--exclude", "--include",
+        "--filter", "--out-format", "--log-file", "--copy-links", "--chown",
+        "--chmod", "--timeout", "--bwlimit", "--port", "--rsh", "--exclude-from",
+        "--include-from", "--filter-merge",
+    ),
+    "rclone": ("--config", "--log-file", "--temp-dir", "--backup-dir", "--drive", "--transfers"),
+    "scp": ("-P", "-i", "-F", "-c", "-l", "-o", "-S", "-J"),
+    "git": ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"),
+    "pip": ("--target", "-t", "--prefix", "--root", "--cache-dir", "--log", "--index-url"),
+    "npm": ("--prefix", "--cache", "--registry", "--loglevel", "--workspace"),
+}
+
+
+def _is_read_only_invocation(verb: str, args: Sequence[str]) -> bool:
+    """Whether *verb* with *args* only reads state.
+
+    Some verbs are only mutating in some of their modes: ``tar -t`` lists,
+    ``unzip -l`` lists, ``git status`` reads. Such an invocation is not a
+    write attempt.
+    """
+    if verb == "tar":
+        return any(
+            "t" in token.lstrip("-")
+            for token in args
+            if re.fullmatch(r"-{0,2}[a-zA-Z]{1,4}", token)
+            and set(token.lstrip("-")) <= set("xtcvzfjhkmOPW")
+        )
+    if verb == "unzip":
+        return any(token in ("-l", "--list") for token in args)
+    if verb == "find":
+        return not any(
+            token in (
+                "-exec", "-execdir", "-ok", "-okdir", "-delete",
+                # These three write their result into a file.
+                "-fprint", "-fprintf", "-fls",
+            )
+            for token in args
+        )
+    positional = [token for token in args if not token.startswith("-")]
+    if verb == "git":
+        # ``git worktree list`` only reads the worktree registry.
+        if len(positional) >= 2 and positional[0] == "worktree" and positional[1] == "list":
+            return True
+        # ``git diff --output=FILE`` writes FILE: it is not a read.
+        if _git_output_file(args) and _git_subcommand(args) in _GIT_OUTPUT_SUBCOMMANDS:
+            return False
+    if verb in ("pip", "pip3", "npm"):
+        # ``pip config list``/``get`` read; ``pip config set``/``unset`` write.
+        if positional and positional[0] == "config":
+            action = positional[1] if len(positional) > 1 else ""
+            return action in ("", "list", "get")
+    read_only = _READ_ONLY_SUBCOMMANDS.get(verb)
+    if not read_only:
+        return False
+    for token in args:
+        if token.startswith("-"):
+            continue
+        return token in read_only
+    return False
+
+
+def _mode_operands(args: Sequence[str], value_options: Sequence[str]) -> List[str]:
+    """The files a ``chmod``/``chown`` command acts on.
+
+    The first operand is the mode or the owner, not a path.
+    """
+    operands = _shell_operands(args, value_options)
+    if operands and not os.path.sep in operands[0]:
+        head = operands[0]
+        if re.fullmatch(r"[0-7]{1,4}", head) or re.fullmatch(
+            r"[ugoa]*[-+=][rwxXst]*", head
+        ) or ":" in head:
+            operands = operands[1:]
+    return operands
+
+
+def _verb_options(verb: str) -> Tuple[str, ...]:
+    """The option values of *verb* (its own options plus the write verbs)."""
+    return tuple(_SHELL_OPTION_VALUES.get(verb, ())) + tuple(
+        _SHELL_WRITE_VERB_OPTIONS.get(verb, ())
+    )
+
+
+def _shell_segments(command: str) -> List[List[str]]:
+    """The individual command segments of a shell command line."""
+    segments: List[List[str]] = []
+    current: List[str] = []
+    for token in _shell_tokenize(command):
+        if token in (";", "&&", "||", "|", "&"):
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _sync_destinations(verb: str, args: Sequence[str]) -> List[str]:
+    """The paths a copy-style command (``rsync`` / ``rclone`` / ``scp``) changes.
+
+    Sources come first and the destination comes last, so the last operand
+    is what is written. A remote target (``host:path``) is not a local path
+    and is left to the shell.
+
+    Some of these commands also REMOVE their source after a successful
+    transfer: ``rclone move`` deletes the source it moved, and
+    ``rsync --remove-source-files`` deletes every source file it
+    transferred. A removed source is a mutation of that path, so it is
+    reported next to the destination.
+    """
+    operands = _shell_operands(args, _verb_options(verb))
+    if not operands:
+        return []
+    destinations: List[str] = []
+    destinations.extend(_sync_removed_sources(verb, args, operands))
+    destination = operands[-1]
+    if ":" in destination and not destination.startswith("/"):
+        return destinations
+    destinations.append(destination)
+    return destinations
+
+
+def _sync_removed_sources(
+    verb: str, args: Sequence[str], operands: Sequence[str]
+) -> List[str]:
+    """The sources a copy-style command deletes after the transfer.
+
+    ``rclone move SOURCE DEST`` moves (and therefore removes) its source,
+    and ``rsync --remove-source-files`` deletes every source file it
+    transferred. Only local paths are reported: a remote source
+    (``host:path``) names another machine's filesystem.
+    """
+    removed: List[str] = []
+    if verb == "rclone":
+        # ``rclone move SOURCE DEST`` and ``rclone moveto SOURCE DEST`` -
+        # the source is deleted afterwards (rclone moves the files and then
+        # removes the originals from the source).
+        if len(operands) >= 3 and operands[0] in ("move", "moveto"):
+            removed.append(operands[-2])
+    elif verb == "rsync":
+        if "--remove-source-files" in args and len(operands) >= 2:
+            removed.extend(operands[:-1])
+    return [
+        token
+        for token in removed
+        if token and not (":" in token and not token.startswith("/"))
+    ]
+
+
+def _tar_destinations(args: Sequence[str]) -> List[str]:
+    """The paths a ``tar`` command writes to.
+
+    An extraction writes into the directory named with ``-C``; a creation
+    writes the archive named with ``-f``. Without either, the target is the
+    working directory, which is not statically known - nothing is claimed.
+    """
+    extract_dir = ""
+    archive = ""
+    modes = ""
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in ("-C", "--directory"):
+            if index + 1 < len(args):
+                extract_dir = args[index + 1]
+                index += 1
+        elif token.startswith("--directory="):
+            extract_dir = token.split("=", 1)[1]
+        elif token in ("-f", "--file"):
+            if index + 1 < len(args):
+                archive = args[index + 1]
+                index += 1
+        elif token.startswith("--file="):
+            archive = token.split("=", 1)[1]
+        elif token.startswith("--"):
+            if token in ("--extract", "--get"):
+                modes += "x"
+            elif token in ("--create", "--get-file"):
+                modes += "c"
+        elif re.fullmatch(r"-{0,2}[a-zA-Z]{1,4}", token) and (
+            set(token.lstrip("-")) <= set("xtcvzfjhkmOPW")
+            and any(letter in token for letter in "xtc")
+        ):
+            # A combined flag word: ``tar xzf archive.tgz`` or ``tar -xzf``.
+            letters = token.lstrip("-")
+            if "t" in letters:
+                modes += "t"
+            else:
+                if "x" in letters:
+                    modes += "x"
+                if "c" in letters:
+                    modes += "c"
+            if "f" in letters and not archive and index + 1 < len(args):
+                if not args[index + 1].startswith("-"):
+                    archive = args[index + 1]
+                    index += 1
+        index += 1
+    if "t" in modes:
+        # ``tar -t`` only lists an archive: it writes nothing.
+        return []
+    if "x" in modes:
+        return [extract_dir] if extract_dir else []
+    return [archive] if archive else []
+
+
+def _unzip_destinations(args: Sequence[str]) -> List[str]:
+    """The directory an ``unzip`` extracts into (``-d``).
+
+    ``unzip -l`` only lists the archive contents and writes nothing.
+    """
+    if any(token in ("-l", "--list") for token in args):
+        return []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in ("-d", "--dir", "--directory"):
+            if index + 1 < len(args):
+                return [args[index + 1]]
+        elif token.startswith("--dir=") or token.startswith("--directory="):
+            return [token.split("=", 1)[1]]
+        index += 1
+    return []
+
+
+#: Options of ``git`` (and ``git worktree``) that take a value, so the
+#: value is never mistaken for a path operand.
+_GIT_VALUE_OPTIONS: Tuple[str, ...] = ("-b", "--branch", "--reason")
+
+
+def _git_value_options() -> Tuple[str, ...]:
+    return tuple(_verb_options("git")) + _GIT_VALUE_OPTIONS
+
+
+#: Git sub-commands whose ``--output`` option writes into a file.
+#:
+#: Verified empirically against git (isolated temporary repository): for
+#: every sub-command listed here git accepts ``--output FILE`` and creates
+#: that file. For the remaining sub-commands (``status``, ``grep``,
+#: ``describe``, ``ls-files``, ``cat-file``, ``show-ref``,
+#: ``for-each-ref``, ``ls-tree``, ``rev-parse``) git rejects the option
+#: with "unknown option `output'" and no file is created, so they stay
+#: read-only.
+_GIT_OUTPUT_SUBCOMMANDS: Tuple[str, ...] = (
+    "diff", "log", "show", "format-patch", "archive", "rev-list",
+    "shortlog", "blame", "annotate", "reflog", "whatchanged",
+)
+
+
+def _git_operands(args: Sequence[str]) -> List[str]:
+    """The non-option operands of a ``git`` command."""
+    operands: List[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in _git_value_options():
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        operands.append(token)
+        index += 1
+    return operands
+
+
+def _git_subcommand(args: Sequence[str]) -> str:
+    """The effective sub-command of a ``git`` command."""
+    operands = _git_operands(args)
+    return operands[0] if operands else ""
+
+
+def _git_output_file(args: Sequence[str]) -> str:
+    """The file a ``git`` command writes its result into (``--output``)."""
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            # Everything after the separator is a pathspec, not an option.
+            break
+        if token.startswith("--output="):
+            return token.split("=", 1)[1]
+        if token == "--output" and index + 1 < len(args):
+            return args[index + 1]
+        index += 1
+    return ""
+
+
+def _git_destinations(args: Sequence[str]) -> List[str]:
+    """The paths a ``git`` command writes to."""
+    operands = _git_operands(args)
+    output = _git_output_file(args)
+    destinations: List[str] = []
+    if output and _git_subcommand(args) in _GIT_OUTPUT_SUBCOMMANDS:
+        destinations.append(output)
+    if not operands:
+        return destinations
+    subcommand = operands[0]
+    rest = operands[1:]
+    if subcommand == "worktree":
+        # ``git worktree add PATH [BRANCH]`` writes into PATH; the action
+        # word is not a path and must never be resolved as one.
+        action = rest[0] if rest else ""
+        if action in ("add", "remove"):
+            destinations.extend(rest[1:2])
+            return destinations
+        if action == "move":
+            # ``git worktree move SRC DST`` removes the worktree at SRC and
+            # creates it at DST: both paths are mutated.
+            destinations.extend(rest[1:3])
+            return destinations
+        # ``list``/``prune``/``lock``/``unlock`` name no worktree path.
+        return destinations
+    if subcommand == "clone":
+        # ``git clone URL [DIR]`` writes into DIR; a single operand means the
+        # working directory, which is not statically known.
+        destinations.extend(rest[-1:] if len(rest) >= 2 else [])
+        return destinations
+    if subcommand == "init":
+        # ``git init [DIR]`` writes into DIR; without one, the working
+        # directory, which is not statically known.
+        destinations.extend(rest[-1:])
+        return destinations
+    return destinations
+
+
+def _pip_destinations(args: Sequence[str]) -> List[str]:
+    """The directory a package installer writes into (``--target``/``--prefix``)."""
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in ("--target", "-t", "--prefix", "--root"):
+            if index + 1 < len(args):
+                return [args[index + 1]]
+        elif token.startswith("--target=") or token.startswith("--prefix="):
+            return [token.split("=", 1)[1]]
+        index += 1
+    return []
+
+
+def _xargs_destinations(args: Sequence[str]) -> List[str]:
+    """The destinations of the command an ``xargs`` runs."""
+    value_options = ("-I", "-i", "-P", "-n", "-L", "-s", "-a", "-d", "-E")
+    index = 0
+    remainder: List[str] = []
+    while index < len(args):
+        token = args[index]
+        if token in value_options:
+            index += 2
+            continue
+        if token.startswith("-") and len(token) > 1:
+            index += 1
+            continue
+        remainder = list(args[index:])
+        break
+    # A redirection ends the wrapped command: what follows it belongs to
+    # the outer shell, not to the command xargs runs.
+    wrapped: List[str] = []
+    for token in remainder:
+        if token in _SHELL_WRITE_REDIRECTS or token in ("<", "<<"):
+            break
+        wrapped.append(token)
+    if not wrapped:
+        return []
+    return _shell_write_destinations(" ".join(wrapped), 1)
+
+
+def _find_destinations(args: Sequence[str]) -> List[str]:
+    """The files a ``find`` command writes to.
+
+    ``-fprint FILE``/``-fprintf FILE FORMAT``/``-fls FILE`` write their
+    result into FILE, and ``-exec``/``-execdir``/``-ok``/``-okdir`` run a
+    command whose own destinations are the write targets.
+    """
+    destinations: List[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in ("-fprint", "-fprintf", "-fls"):
+            if index + 1 < len(args):
+                destinations.append(args[index + 1])
+            index += 2
+            continue
+        if token in ("-exec", "-execdir", "-ok", "-okdir"):
+            remainder: List[str] = []
+            cursor = index + 1
+            while cursor < len(args) and args[cursor] not in (";", "+"):
+                remainder.append(args[cursor])
+                cursor += 1
+            if remainder:
+                destinations.extend(_shell_write_destinations(" ".join(remainder), 1))
+            # Continue after the terminator: a later ``-fprint`` still
+            # writes its file.
+            index = cursor + 1
+            continue
+        index += 1
+    return destinations
+
+
+def _segment_has_write_intent(segment: Sequence[str]) -> bool:
+    """Whether one command segment attempts a write."""
+    verb, args = _shell_verb(segment)
+    if not verb:
+        return False
+    if verb not in _SHELL_WRITE_VERBS:
+        return False
+    return not _is_read_only_invocation(verb, args)
+
+
+#: Verbs whose destination cannot always be resolved statically. Only for
+#: these may a protected path that is named as an operand escalate a command
+#: whose destination the resolver could not pin down.
+_AMBIGUOUS_DEST_VERBS: Tuple[str, ...] = (
+    "tar", "unzip", "xargs", "find", "rsync", "rclone", "scp", "git", "pip",
+    "pip3", "npm", "sponge", "sh", "bash", "zsh", "dash", "ksh",
+)
+
+
+def _ambiguous_protected_write(tool_name: str, args: Any) -> Optional[str]:
+    """A protected path a mutating command names but cannot attribute.
+
+    Some writes cannot be resolved to a destination: an unknown option, a
+    wrapped command, an environment-dependent path. When such a command
+    names a protected surface as one of its operands, the write cannot be
+    shown to be harmless, so it is escalated to the operator's gate instead
+    of being allowed silently.
+
+    A path that is only *mentioned* - as the source of a copy, or as an
+    argument of an interpreter - is not a write attempt and stays allowed.
+    """
+    for text, is_python in _exec_texts(tool_name, args):
+        if is_python:
+            continue
+        segments = _shell_segments(text)
+        if not segments:
+            continue
+        for segment in segments:
+            verb, verb_args = _shell_verb(segment)
+            if not verb or verb not in _AMBIGUOUS_DEST_VERBS:
+                continue
+            if not _segment_has_write_intent(segment):
+                continue
+            # A segment that resolves its OWN destination is not ambiguous:
+            # the write can be attributed and is judged on its target. The
+            # check is per segment, so a benign resolved write elsewhere in
+            # the same command cannot mask an unverifiable protected write.
+            if _segment_destinations(segment):
+                continue
+            for operand in _shell_operands(verb_args, _verb_options(verb)):
+                if not _looks_like_path(operand):
+                    continue
+                if is_protected_path(operand) or is_control_plane_path(operand):
+                    return operand
+    return None
+
+
+def _looks_like_path(token: str) -> bool:
+    """Whether *token* looks like a filesystem path rather than a word.
+
+    A bare word such as ``worktree`` or ``add`` is a command argument, not
+    a path: resolving it against the working directory would turn any
+    sub-command into a spurious write target. A URL is not a path either -
+    a package index or a remote endpoint names a value, not a local file.
+    """
+    if not token:
+        return False
+    if "://" in token:
+        return False
+    if token.startswith(("/", "~")):
+        return True
+    if os.path.sep not in token:
+        return False
+    head = token.split(os.path.sep, 1)[0]
+    if head in (".", ".."):
+        return True
+    # A first segment that carries a dot is a host name, not a directory:
+    # ``example.invalid/x`` is a remote location, not a local file.
+    return "." not in head
+
+
+def _segment_destinations(segment: Sequence[str], depth: int = 0) -> List[str]:
+    """The destinations of a single command segment."""
+    verb, args = _shell_verb(segment)
+    if not verb:
+        return []
+    found = _destinations_for_verb(verb, args, depth)
+    found.extend(_redirect_destinations(args))
+    return found
+
+
 def _destinations_for_verb(
     verb: str, args: Sequence[str], depth: int
 ) -> List[str]:
@@ -1675,6 +2234,28 @@ def _destinations_for_verb(
         return _download_destinations(
             args, ("-O", "--output-document", "--output-file"), "-O"
         )
+    if verb in ("rsync", "rclone", "scp"):
+        return _sync_destinations(verb, args)
+    if verb == "tar":
+        return _tar_destinations(args)
+    if verb == "unzip":
+        return _unzip_destinations(args)
+    if verb == "git":
+        return _git_destinations(args)
+    if verb in ("pip", "pip3"):
+        return _pip_destinations(args)
+    if verb == "npm":
+        return _pip_destinations(args)
+    if verb == "sponge":
+        return _shell_operands(args, _verb_options(verb))
+    if verb == "xargs":
+        return _xargs_destinations(args)
+    if verb == "find":
+        return _find_destinations(args)
+    if verb in ("mkdir", "touch"):
+        return _shell_operands(args, _verb_options(verb))
+    if verb in ("chmod", "chown"):
+        return _mode_operands(args, _verb_options(verb))
     if verb in ("python", "python2", "python3", "pypy"):
         return _python_inline_destinations(args)
     if verb in ("sh", "bash", "zsh", "dash", "ksh"):
@@ -1978,6 +2559,58 @@ def _carries_a_control(raw_path: str) -> bool:
         or is_instruction_path(raw_path)
         or is_skill_path(raw_path)
         or is_firewall_state_surface(raw_path)
+    )
+
+
+# --------------------------------------------------------------------------- #
+# G1 destination gate (scanner-independent)
+#
+# Rationale (see gates/P0_APPROVE_SEMANTICS.md): an ``approve`` verdict is NOT
+# an authorization guarantee. In yolo / approvals-off / allowlisted /
+# cron-approve / single-query-approve / unattended-approve contexts Hermes Core
+# auto-approves it with no human in the loop, so for the G1 invariant ("an
+# undetected prompt injection must not cause an unauthorized protected-state
+# mutation") an ``approve`` on these surfaces is equivalent to ``allow``.
+#
+# The destinations below are *durable instruction, credential, or control-plane
+# surfaces*: a write to one of them is exactly the persistent compromise an
+# undetected injection would aim for, and the operator cannot have pre-authorized
+# the specific content (no trusted provenance signal reaches the hook). They are
+# therefore refused outright from ``(tool_name, args, destination)`` alone -
+# never from content - so the refusal survives a total scanner false-negative.
+#
+# Ordinary protected writes (e.g. a ``.bashrc`` alias) are NOT in this set: they
+# stay escalated to ``approve``, which is the correct operator gate for a write
+# that is not inherently a durable-instruction/credential mutation.
+# --------------------------------------------------------------------------- #
+
+#: Reason keys the destination gate can return. Kept as constants so the
+#: verdict matrix and tests can assert on them without string drift.
+GATE_REASON_INSTRUCTION_SURFACE = "destination_instruction_surface_write"
+GATE_REASON_CREDENTIAL = "credential_path_write"  # reused existing reason
+GATE_REASON_CONTROL_PLANE = "destination_control_plane_write"
+GATE_REASON_MEMORY = "destination_memory_durable_write"
+GATE_REASON_SKILL = "destination_skill_durable_write"
+
+
+def is_durable_instruction_surface(raw_path: str) -> bool:
+    """True for a path whose *content* becomes a standing instruction for a
+    future agent turn: the instruction files (``AGENTS.md`` and siblings) and
+    Skill files.
+
+    These are the paths an undetected injection most wants to write, and the
+    paths where "the operator approved it" cannot be established from inside
+    the plugin. The firewall's own ``config.yaml`` is deliberately NOT in this
+    set: it is the operator's own configuration file, which the operator
+    legitimately edits, so an ordinary write to it stays on the ``approve``
+    operator gate. The dangerous case - a write that switches the firewall off
+    or removes its entry - is caught separately in section 4b by a *content*
+    discriminator (``config_firewall_state_mutation``), not by destination, and
+    is blocked there.
+    """
+    return (
+        is_instruction_path(raw_path)
+        or is_skill_path(raw_path)
     )
 
 
@@ -2333,10 +2966,17 @@ def _evaluate_scoped_call(tool_name: str, args: Any) -> Verdict:
     )
 
 
-def evaluate_tool_call(tool_name: str, args: Any) -> Verdict:
+def evaluate_tool_call(tool_name: str, args: Any, *, grant: Any = None) -> Verdict:
     """Evaluate a single tool call against the trust boundary.
 
     Returns a :class:`Verdict`. ``block`` means the call must not execute.
+
+    ``grant`` is an optional ``(session_id, turn_id)`` tuple identifying the
+    operator turn on which a Scoped Intent Grant may have been captured. It is
+    consulted ONLY at the durable-instruction-surface write branch, and ONLY for
+    a single-target atomic ``write_file`` whose content hash matches the
+    authorized hash. Every other rule runs unchanged; the grant never short-
+    circuits the rest of this evaluation.
     """
     name = (tool_name or "").lower()
     content = _arg_text(args)
@@ -2444,6 +3084,56 @@ def evaluate_tool_call(tool_name: str, args: Any) -> Verdict:
             )
 
     # ------------------------------------------------------------------ #
+    # 3b. Destination-only durable-instruction-surface gate (P0 closure).
+    #
+    #     Section 3 above blocks instruction-shaped CONTENT; section 5 below
+    #     gates PROTECTED paths. But a durable instruction surface (AGENTS.md /
+    #     SKILL.md) can live OUTSIDE the protected roots (e.g. /tmp/x/SKILL.md or
+    #     a project-local SKILL.md), and a symlink alias can hide the canonical
+    #     target from is_protected_path. The G1 invariant is scanner-independent
+    #     and destination-based, so it must hold for EVERY durable surface, not
+    #     only protected ones. This branch runs regardless of injection findings
+    #     and regardless of is_protected_path, on the CANONICAL path.
+    #
+    #     P0-A: a matching grant suppresses ONLY this destination-specific denial.
+    #     It NEVER returns ALLOW early. Every downstream check (sections 4, 4b, 5,
+    #     6, 7) still executes; the grant is consumed at the FINAL authorization
+    #     decision only if no other rule blocked or escalated the call.
+    # ------------------------------------------------------------------ #
+    grant_authorized_canon = None  # set iff a grant lifts THIS destination denial
+    if name in WRITE_TOOLS:
+        durable_targets = [t for t in targets if is_durable_instruction_surface(t)]
+        if durable_targets:
+            # P0-5: only a single-target atomic write_file may be grant-exempted.
+            # Strict single-target semantics: exactly ONE parsed target overall,
+            # and it must be the durable surface (no nested/mixed effects).
+            if name == "write_file" and grant is not None and len(targets) == 1:
+                from . import grants as _g
+                content_arg = args.get("content") if isinstance(args, dict) else None
+                canon = normalize_path(durable_targets[0])
+                # A grant must NEVER downgrade protection for the Firewall's own
+                # code/config/state paths. Such a surface stays fail-closed BLOCK
+                # regardless of any grant (an APPROVE could be auto-approved).
+                if canon and not is_firewall_state_surface(canon) \
+                        and _g.grant_matches(grant[0], grant[1], canon, content_arg):
+                    # Lift ONLY this denial; do NOT allow yet. Fall through so all
+                    # remaining policy checks run. Consumption happens at the end.
+                    grant_authorized_canon = canon
+            if grant_authorized_canon is None:
+                return Verdict(
+                    action="block",
+                    reason=GATE_REASON_INSTRUCTION_SURFACE,
+                    detail=(
+                        "Blocked: refused to write the durable instruction surface "
+                        f"{normalize_path(durable_targets[0])!r}. This gate is "
+                        "destination-based and applies even outside protected roots "
+                        "and through symlink aliases; an approval prompt is not a "
+                        "guarantee in auto-approval modes."
+                    ),
+                    findings=tuple(findings),
+                )
+
+    # ------------------------------------------------------------------ #
     # 4. Gateway / endpoint redirect.
     #
     # Context-sensitive by design: a URL only counts when it is *bound* to
@@ -2490,18 +3180,25 @@ def evaluate_tool_call(tool_name: str, args: Any) -> Verdict:
             _write_payload_text(args, include_selectors=name in _EDIT_TOOLS)
         )
         if mutation:
+            # G1 destination gate - switching THIS firewall off (or removing
+            # its config entry) is the highest-value control-plane mutation an
+            # undetected injection can make. Per P0 an ``approve`` is
+            # auto-approved in yolo / approvals-off / cron-approve /
+            # unattended-approve modes, so escalating it would let an
+            # undetected injection switch the firewall off in exactly those
+            # modes. It is therefore refused outright; the operator must make
+            # this change directly, outside the agent's tool path.
             return Verdict(
-                action="approve",
-                reason="firewall_state_mutation",
+                action="block",
+                reason=GATE_REASON_CONTROL_PLANE,
                 detail=(
-                    "Approval required: this call changes the firewall's own "
+                    "Blocked: this call changes the firewall's own "
                     f"state ({mutation}) in {normalize_path(state_targets[0])!r}. "
-                    "Only a fresh, explicit operator decision may authorize "
-                    "it; the firewall never authorizes itself."
-                ),
-                rule_key=(
-                    "prompt-firewall.firewall-state:"
-                    f"{normalize_path(state_targets[0])}"
+                    "The firewall cannot establish operator authorization, and "
+                    "an approval prompt is not a guarantee in auto-approval "
+                    "modes, so the change is refused rather than escalated. "
+                    "The operator must change the firewall configuration "
+                    "directly."
                 ),
                 findings=tuple(findings),
             )
@@ -2522,6 +3219,27 @@ def evaluate_tool_call(tool_name: str, args: Any) -> Verdict:
             for t in write_targets
             if is_protected_path(t) or is_control_plane_path(t)
         ]
+        if not protected_exec:
+            # A segment that names a protected surface without a resolvable
+            # destination is escalated on its own. The check is per segment:
+            # a benign resolved write elsewhere in the same command must not
+            # mask an unverifiable protected write.
+            ambiguous = _ambiguous_protected_write(name, args)
+            if ambiguous:
+                return Verdict(
+                    action="approve",
+                    reason="protected_write_unverifiable",
+                    detail=(
+                        "Approval required: this command writes to the "
+                        f"protected path {normalize_path(ambiguous)!r}, but "
+                        "the firewall cannot resolve where the write lands."
+                    ),
+                    rule_key=(
+                        "prompt-firewall.protected-write:"
+                        f"{normalize_path(ambiguous)}"
+                    ),
+                    findings=tuple(findings),
+                )
         if protected_exec:
             exec_target = protected_exec[0]
             if injection:
@@ -2545,6 +3263,26 @@ def evaluate_tool_call(tool_name: str, args: Any) -> Verdict:
                         f"{posixpath.dirname(normalize_path(exec_target))}"
                         "/[REDACTED]. Credential files are protected from "
                         "tool-driven writes."
+                    ),
+                    findings=tuple(findings),
+                )
+            # G1 destination gate - an exec write whose destination is a
+            # durable instruction / control-plane surface (AGENTS.md-class,
+            # Skill files, firewall state) is refused, not escalated. Ordinary
+            # protected exec destinations (``.bashrc``) stay on the ``approve``
+            # path below, because they are not durable-instruction surfaces and
+            # the operator gate is the right control for them.
+            if is_durable_instruction_surface(exec_target):
+                return Verdict(
+                    action="block",
+                    reason=GATE_REASON_INSTRUCTION_SURFACE,
+                    detail=(
+                        "Blocked: this command writes the durable instruction / "
+                        f"control-plane surface {normalize_path(exec_target)!r}. "
+                        "The firewall cannot establish operator authorization, "
+                        "and an approval prompt is not a guarantee in "
+                        "auto-approval modes, so the write is refused rather "
+                        "than escalated."
                     ),
                     findings=tuple(findings),
                 )
@@ -2653,6 +3391,61 @@ def evaluate_tool_call(tool_name: str, args: Any) -> Verdict:
                 ),
                 findings=tuple(findings),
             )
+        # G1 destination gate - a durable instruction / control-plane surface
+        # (AGENTS.md-class instruction files, Skill files, the firewall's own
+        # state) is refused outright, NOT escalated to ``approve``. Per P0 an
+        # ``approve`` is auto-approved in yolo / approvals-off / cron-approve /
+        # unattended-approve contexts, so escalating these surfaces would leave
+        # the G1 hole open in exactly those modes. The decision is made from the
+        # destination alone, so it holds even when the scanner finds nothing.
+        # Ordinary protected writes (``.bashrc`` and similar) are NOT caught
+        # here; they continue to the ``approve`` branches below.
+        if is_durable_instruction_surface(target):
+            # P0 remediation: a Scoped Intent Grant may exempt THIS exact write,
+            # but only when ALL of the following hold (otherwise fail closed):
+            #   * the tool is a single-target atomic ``write_file`` (P0-5);
+            #   * it is the ONLY instruction-surface target in the call;
+            #   * a grant was captured on this operator turn (P0-3);
+            #   * the grant's canonical path matches and its SHA-256 matches the
+            #     exact proposed content (P0-4).
+            # The grant lifts ONLY this denial; every other rule above and below
+            # still runs. Shell / terminal / mixed-effect calls never qualify.
+            # Consumption happens once, at the final protected-write decision.
+            if name == "write_file" and grant is not None:
+                from . import grants as _g
+                surfaces = [t for t in targets if is_durable_instruction_surface(t)]
+                content_arg = args.get("content") if isinstance(args, dict) else None
+                if len(surfaces) == 1 and _g.grant_matches(
+                        grant[0], grant[1], normalize_path(target), content_arg):
+                    # Authorized exact write: fall through to the remaining
+                    # checks instead of returning the instruction-surface block.
+                    pass
+                else:
+                    return Verdict(
+                        action="block",
+                        reason=GATE_REASON_INSTRUCTION_SURFACE,
+                        detail=(
+                            "Blocked: refused to write the durable instruction / "
+                            f"control-plane surface {normalize_path(target)!r}. The "
+                            "operator grant did not match this exact path+content "
+                            "(or was already used), so the write is refused."
+                        ),
+                        findings=tuple(findings),
+                    )
+            else:
+                return Verdict(
+                    action="block",
+                    reason=GATE_REASON_INSTRUCTION_SURFACE,
+                    detail=(
+                        "Blocked: refused to write the durable instruction / "
+                        f"control-plane surface {normalize_path(target)!r}. The "
+                        "firewall cannot establish operator authorization for this "
+                        "content, and an approval prompt is not a guarantee in "
+                        "auto-approval modes, so the write is refused rather than "
+                        "escalated. Ask the operator to make this change directly."
+                    ),
+                    findings=tuple(findings),
+                )
         # PF-03 - a patch payload names the destination, but the resulting
         # file content cannot be verified here, so it is escalated rather
         # than allowed.
@@ -2723,22 +3516,30 @@ def evaluate_tool_call(tool_name: str, args: Any) -> Verdict:
         # filesystem with no gate at all. A reason that names an approval
         # the firewall never requested was therefore a false promise, so the
         # verdict is escalated here rather than delegated.
-        return Verdict(
-            action="approve",
-            reason="protected_write_requires_approval",
-            detail=(
-                "Approval required: this call writes the protected path "
-                f"{normalize_path(target)!r}. Hermes Core does not gate this "
-                "path, so the firewall escalates it instead of allowing it "
-                "through on a reason that promised an approval it never "
-                "asked for."
-            ),
-            rule_key=(
-                "prompt-firewall.protected-write:"
-                f"{normalize_path(target)}"
-            ),
-            findings=tuple(findings),
-        )
+        # P0-A (single consumption point): do NOT consume or allow here. If a
+        # grant lifted the destination denial in section 3b for THIS exact target,
+        # skip the protected-write escalation and fall through so sections 6-7 and
+        # the FINAL authorization branch run. The grant is consumed exactly once,
+        # at the final decision. A grant never downgrades protection here.
+        if grant_authorized_canon is not None and normalize_path(target) == grant_authorized_canon:
+            pass  # fall through to the final authorization decision
+        else:
+            return Verdict(
+                action="approve",
+                reason="protected_write_requires_approval",
+                detail=(
+                    "Approval required: this call writes the protected path "
+                    f"{normalize_path(target)!r}. Hermes Core does not gate this "
+                    "path, so the firewall escalates it instead of allowing it "
+                    "through on a reason that promised an approval it never "
+                    "asked for."
+                ),
+                rule_key=(
+                    "prompt-firewall.protected-write:"
+                    f"{normalize_path(target)}"
+                ),
+                findings=tuple(findings),
+            )
 
     # ------------------------------------------------------------------ #
     # 6. Executable actions that mention protected paths.
@@ -2784,6 +3585,24 @@ def evaluate_tool_call(tool_name: str, args: Any) -> Verdict:
                 "Blocked: refusing to install a Skill whose payload carries an "
                 f"injection signature (pattern {injection.pattern})."
             ),
+            findings=tuple(findings),
+        )
+
+    # P0-A: final authorization decision. If a grant lifted the destination-
+    # specific instruction-surface denial in section 3b AND every downstream
+    # check (4, 4b, 5, 6, 7) passed without blocking or escalating, consume the
+    # grant one-shot and allow THIS exact write. No early allow anywhere above.
+    if grant_authorized_canon is not None and grant is not None:
+        from . import grants as _g
+        content_arg = args.get("content") if isinstance(args, dict) else None
+        if _g.consume_grant(grant[0], grant[1], grant_authorized_canon, content_arg):
+            return Verdict(action="allow", reason="operator_grant_exact_write",
+                           findings=tuple(findings))
+        # Grant vanished/expired between match and consume -> fail closed.
+        return Verdict(
+            action="block",
+            reason=GATE_REASON_INSTRUCTION_SURFACE,
+            detail="Blocked: the operator grant expired or was consumed before the write.",
             findings=tuple(findings),
         )
 

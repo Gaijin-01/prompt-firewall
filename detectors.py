@@ -101,7 +101,25 @@ _INVISIBLE_RE = re.compile(
 # Long base64 / hex / percent-encoded runs that could carry an encoded payload.
 _B64_RE = re.compile(r"[A-Za-z0-9+/]{60,}={0,2}")
 _HEX_RE = re.compile(r"(?:0x)?[0-9a-fA-F]{80,}")
-_PCT_RE = re.compile(r"(?:%[0-9a-fA-F]{2}){20,}")
+
+#: A single percent-escape triplet. Percent-encoded payloads are usually
+#: *sparse*: ``urllib.parse.quote`` leaves alphanumerics unescaped, so the
+#: escapes of a hidden instruction are separated by literal words. Requiring
+#: a long contiguous run of escapes therefore misses the common case.
+_PCT_ESCAPE_RE = re.compile(r"%[0-9a-fA-F]{2}")
+
+#: Backslash escapes (backslash-u, backslash-U, backslash-x) used to hide
+#: text from plain matching.
+_ESCAPE_SEQ_RE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2})")
+
+#: Minimum number of escapes that make a group an encoded region.
+_ESCAPE_GROUP_MIN = 3
+#: Maximum number of literal characters that may separate two escapes of
+#: the same group.
+_ESCAPE_GROUP_GAP = 24
+#: Maximum number of literal characters a group may absorb on either side
+#: when it is expanded to word boundaries.
+_ESCAPE_WORD_SPAN = 48
 
 _MAX_SCAN_CHARS = 400_000
 
@@ -1390,13 +1408,18 @@ def _scan_rules(
     remap: Optional[List[int]] = None,
 ) -> None:
     """Run the rule table over *text*, appending findings to *findings*."""
-    # Pre-index frame matches once; reused for every gated finding.
-    frame_index = _FrameIndex(text) if text else None
-    # Built on the first match that needs it: a document without such a
-    # match pays nothing for the context analysis.
+    # _FrameIndex is built lazily on the first match that actually needs it
+    # (mixed_language_override or a _FRAME_GATED_RULES rule). It is a pure
+    # function of *text*, so building it on first use is semantically identical
+    # to building it up front; a document with no frame-gated match (the common
+    # benign case) never pays the indexing cost. _ContextIndex is likewise lazy.
+    frame_index = None
     context_index = None
     for pattern_id, category, regex, severity in _RULES:
         for match in regex.finditer(text):
+            if pattern_id == "mixed_language_override" or pattern_id in _FRAME_GATED_RULES:
+                if frame_index is None:
+                    frame_index = _FrameIndex(text)
             if pattern_id == "mixed_language_override" and frame_index is not None and _mixed_descriptive_frame(
                 text, match.start(), match.end(), frame_index
             ):
@@ -1467,6 +1490,57 @@ def scan_text(
 # --------------------------------------------------------------------------- #
 
 
+def _escape_groups(pattern, text):
+    """Group escape sequences that belong to one encoded region.
+
+    Escapes of the same encoded message are separated by literal characters
+    (a percent-encoded sentence keeps its letters), so they are grouped by
+    proximity rather than by adjacency.
+    """
+    groups = []
+    current = []
+    for match in pattern.finditer(text):
+        if current and (match.start() - current[-1].end()) > _ESCAPE_GROUP_GAP:
+            groups.append(current)
+            current = []
+        current.append(match)
+    if current:
+        groups.append(current)
+    return [g for g in groups if len(g) >= _ESCAPE_GROUP_MIN]
+
+
+def _expand_to_word(text, start, end):
+    """Grow ``[start, end)`` over the literal word characters around it.
+
+    The first and last word of an encoded message usually sit outside the
+    escape run (only the characters that were escaped are escaped), so the
+    decoded text is extended to the enclosing word boundaries.
+    """
+    limit = _ESCAPE_WORD_SPAN
+    i = start
+    moved = 0
+    while i > 0 and moved < limit and (text[i - 1].isalnum() or text[i - 1] == "_"):
+        i -= 1
+        moved += 1
+    j = end
+    moved = 0
+    while j < len(text) and moved < limit and (text[j].isalnum() or text[j] == "_"):
+        j += 1
+        moved += 1
+    return i, j
+
+
+def _decode_escape(token):
+    """Decode one backslash escape to the character it names."""
+    body = token[1:]
+    try:
+        if body[0] in "uU":
+            return chr(int(body[1:], 16))
+        return chr(int(body, 16))
+    except (ValueError, IndexError, OverflowError):
+        return token
+
+
 def _decode_candidates(text: str) -> Iterable[Tuple[str, str, int, int]]:
     """Yield ``(encoding, decoded_text, start, end)`` for encoded payloads."""
     for match in _B64_RE.finditer(text):
@@ -1499,13 +1573,22 @@ def _decode_candidates(text: str) -> Iterable[Tuple[str, str, int, int]]:
         if decoded:
             yield ("hex", decoded, match.start(), match.end())
 
-    for match in _PCT_RE.finditer(text):
+    for group in _escape_groups(_PCT_ESCAPE_RE, text):
+        start, end = _expand_to_word(text, group[0].start(), group[-1].end())
+        blob = text[start:end]
         try:
-            decoded = urllib.parse.unquote(match.group(0))
+            decoded = urllib.parse.unquote(blob)
         except Exception:
             continue
-        if decoded:
-            yield ("percent", decoded, match.start(), match.end())
+        if decoded and decoded != blob:
+            yield ("percent", decoded, start, end)
+
+    for group in _escape_groups(_ESCAPE_SEQ_RE, text):
+        start, end = _expand_to_word(text, group[0].start(), group[-1].end())
+        blob = text[start:end]
+        decoded = _ESCAPE_SEQ_RE.sub(lambda mo: _decode_escape(mo.group(0)), blob)
+        if decoded and decoded != blob:
+            yield ("unicode_escape", decoded, start, end)
 
 
 def _scan_encoded(text: str, seen: set, depth: int = 0) -> List[Finding]:

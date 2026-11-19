@@ -281,6 +281,25 @@ def _basename(token: str) -> str:
     return os.path.basename(token.rstrip("/")) or token
 
 
+def _strip_env_assignments(tokens: List[str]) -> List[str]:
+    """Drop the ``NAME=value`` assignments that precede a command word.
+
+    ``FOO=1 rm /path`` runs ``rm``. Reading the assignment as the command
+    word made the explanation name the wrong command and lose the risk
+    signal of the verb that actually runs.
+    """
+    index = 0
+    while index < len(tokens):
+        name, sep, _value = tokens[index].partition("=")
+        if not sep or not name or not _ENV_ASSIGNMENT_NAME_RE.match(name):
+            break
+        index += 1
+    return list(tokens[index:])
+
+
+#: The name part of a shell environment assignment (``NAME=value``).
+_ENV_ASSIGNMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 def _strip_wrappers(tokens: List[str], include_runners: bool = True) -> List[str]:
     """Drop leading wrapper verbs (and their value-taking options).
 
@@ -298,6 +317,12 @@ def _strip_wrappers(tokens: List[str], include_runners: bool = True) -> List[str
     }
     tokens = list(tokens)
     while tokens:
+        # An environment assignment (``FOO=1 rm ...``) is not the command:
+        # it only sets a variable for the command that follows.
+        stripped = _strip_env_assignments(tokens)
+        if stripped != tokens:
+            tokens = stripped
+            continue
         base = _basename(tokens[0])
         if base in _shell_runners() and not include_runners:
             break
