@@ -10,7 +10,7 @@ Version **1.1.8** is a plugin-only release candidate. It is not published to the
 - Portable scratch-exclusion regression: a `.hermes/cache` path stays scratch when `HERMES_HOME` points at a different home. Negative fixtures assert that `.hermes/plugins/*`, `.hermes/config.yaml`, `.hermes/AGENTS.md`, `.hermes/SOUL.md`, nested `.hermes` homes, protected symlink aliases and `..` traversal remain protected.
 - Protected-path and destination-based blocking improvements in `policy.py`.
 - Scoped-grant and audit-attribution improvements in `__init__.py` and `action_context.py`.
-- Self-contained test dependency closure: the full regression suite runs from a source checkout without a Hermes Core checkout. Tests and audit evidence are kept out of the published runtime tree.
+- Self-contained test dependency closure for the complete pre-extraction candidate checkout: the full 557-test suite runs from that checkout without a Hermes Core checkout. The public tree retains 7 test files, not the full suite: 298 pass with a matching Hermes Core, 284 pass without Core, and the 14 Core-dependent cases cannot run. Tests and audit evidence are kept out of the published runtime tree.
 
 The 1.1.7 baseline is preserved as published history. Version 1.1.8 does not rewrite or replace that history. The experimental Durable Ledger developed alongside this release is **not part of this plugin**: it is absent from the shipped tree and is not imported by any runtime module. No OS-backed monotonic trust, same-UID isolation, D12 rollback guarantee or native Core enforcement is claimed by this release.
 

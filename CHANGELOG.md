@@ -13,7 +13,7 @@ Plugin-only update of the deterministic firewall. Baseline: published v1.1.7. No
 ### Added
 - Portable regression coverage with negative fixtures for `.hermes/plugins/*`, `.hermes/config.yaml`, `.hermes/AGENTS.md`, `.hermes/SOUL.md`, nested `.hermes` homes, protected symlink aliases and `..` traversal.
 - `action_context.py` with strict package-relative imports and centralized decision dispatch.
-- Self-contained test dependency closure so the full suite runs without a Hermes Core checkout (source checkout only; not shipped in the runtime tree).
+- Self-contained test dependency closure for the complete pre-extraction candidate checkout: its full suite runs without a Hermes Core checkout. That checkout is not shipped. The public tree retains 7 test files: 298 pass with a matching Hermes Core; 284 pass without Core, where the 14 Core-dependent cases cannot run.
 
 ### Changed
 - Protected-path and destination-based blocking improvements in `policy.py`.
