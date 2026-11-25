@@ -52,13 +52,13 @@ EVIL = "".join(chr(c) for c in (
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     # The grant now requires sender_id to match the configured operator allowlist.
-    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "100000001")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "309030386")
     grants.reset_all_grants()
     yield
     grants.reset_all_grants()
 
 
-def _turn(message, session_id="s1", turn_id="t1", sender_id="100000001",
+def _turn(message, session_id="s1", turn_id="t1", sender_id="309030386",
           platform="telegram", parent_session_id=""):
     pf._on_pre_llm_call(
         user_message=message, session_id=session_id, turn_id=turn_id,
@@ -265,13 +265,13 @@ def test_grant_covers_skill_outside_roots(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def test_unauthorized_sender_no_grant(monkeypatch):
-    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "100000001")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "309030386")
     _authorize(sender_id="999999999")        # not in allowlist
     assert _write(AGENTS) == "block"
 
 
 def test_webhook_platform_no_grant(monkeypatch):
-    monkeypatch.setenv("WEBHOOK_ALLOWED_USERS", "100000001")
+    monkeypatch.setenv("WEBHOOK_ALLOWED_USERS", "309030386")
     _authorize(platform="webhook")           # webhook removed from eligibility
     assert _write(AGENTS) == "block"
 

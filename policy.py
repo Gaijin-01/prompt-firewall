@@ -37,9 +37,17 @@ executable actions are refused rather than allowed.
 
 from __future__ import annotations
 
+# G1: decision-contract container. Required package-relative import:
+# never fall back to an unrelated top-level module from sys.path.
+from .action_context import (  # type: ignore[import-not-found]
+    ActionContext, ActionAuthorization, SourceProvenance,
+)
+from .executable_view import executable_command_view
+
 import hashlib
 import ipaddress
 import json
+import ast
 import os
 import posixpath
 import re
@@ -193,12 +201,22 @@ _URL_SCHEME = r"(?:https?|wss?)" + r"://"
 
 #: An endpoint key bound to a URL: ``base_url: <url>``, ``base_url=<url>``.
 _ENDPOINT_ASSIGNMENT_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(?:"
+    r"(?i)(?<![A-Za-z0-9_])(?:"
     r"base_?url|api_?base|api_?url|endpoint|ollama_?host|llm_?base_?url|"
     r"hermes_?base_?url|vllm_?base_?url|litellm_?base_?url|"
     r"azure_?openai_?endpoint|api"
     r")(?![A-Za-z0-9])"
     r"[\"\u0027]?\s*(?::|=>|->|=|\bto\b)\s*"
+    r"[\"']?(?P<url>" + _URL_SCHEME + r"[^\s\"'<>]+)"
+)
+
+#: Shell environment assignment: ``export OPENAI_BASE_URL=<url>``.
+_SHELL_ENV_ENDPOINT_RE = re.compile(
+    r"(?i)\bexport\s+(?:OPENAI_BASE_URL|OPENAI_API_BASE|ANTHROPIC_BASE_URL|"
+    r"ANTHROPIC_API_URL|AZURE_OPENAI_ENDPOINT|AZURE_OPENAI_API_BASE|"
+    r"HERMES[A-Z0-9_]*(?:ENDPOINT|BASE_URL|API_URL|API_BASE)|"
+    r"OLLAMA_HOST|OLLAMA_BASE_URL|LITELLM_BASE_URL|VLLM_BASE_URL|"
+    r"LITELLM_API_BASE)\s*=\s*"
     r"[\"']?(?P<url>" + _URL_SCHEME + r"[^\s\"'<>]+)"
 )
 
@@ -491,12 +509,17 @@ _PROTECTED_PATH_MARKERS: Tuple[str, ...] = (
 # --------------------------------------------------------------------------- #
 
 
-def normalize_path(raw: str) -> str:
+def normalize_path(raw: str, cwd: Optional[str] = None) -> str:
     """Normalize *raw* without ever raising on hostile path input.
 
     Invalid path data is returned as a safe sentinel. Callers must treat the
     sentinel as unclassifiable and fail closed; it is never an authorization
     for a write.
+
+    ``cwd`` is the *execution* directory of the tool call. When it is not
+    supplied the process cwd remains the fallback for compatibility, but an
+    ambient gateway cwd must never silently reclassify a relative shell
+    destination as a protected path (P0-2).
     """
     if not isinstance(raw, str) or not raw:
         return ""
@@ -510,7 +533,8 @@ def normalize_path(raw: str) -> str:
         if not isinstance(expanded, str) or "\x00" in expanded:
             return ""
         if not os.path.isabs(expanded):
-            expanded = posixpath.join(os.getcwd(), expanded)
+            base = cwd or os.getcwd()
+            expanded = posixpath.join(base, expanded)
         real = os.path.realpath(expanded)
         if os.path.exists(expanded):
             return real
@@ -559,6 +583,36 @@ PROTECTED_HERMES_HOME_DIRS: Tuple[str, ...] = (
     "profiles",
     "config",
 )
+
+
+def enforcement_eligible(finding, context=None) -> bool:
+    """G2 contract hook: raw findings are detection by default.
+
+    At G2 every finding remains eligible so existing rules keep exact behaviour.
+    Later gates narrow eligibility only for verified data-only contexts.
+    """
+    return finding is not None
+
+
+def resolve_decision(veto: bool, unresolved: bool) -> str:
+    """G4 formal precedence: verified veto > unresolved protected > no violation."""
+    if veto:
+        return "block"
+    if unresolved:
+        return "approve"
+    return "allow"
+
+
+def dispatch_decision(*, veto_reason=None, veto_detail=None, unresolved_reason=None,
+                      findings=()):
+    """G4 centralized decision: verified veto BLOCK > unresolved APPROVE > None."""
+    if veto_reason:
+        return Verdict(action="block", reason=veto_reason, detail=veto_detail or "",
+                       findings=tuple(findings))
+    if unresolved_reason:
+        return Verdict(action="approve", reason=unresolved_reason,
+                       findings=tuple(findings))
+    return None
 
 
 def _active_hermes_home() -> str:
@@ -628,6 +682,14 @@ _NON_PERSISTENT_HOME_DIRS: Tuple[str, ...] = (
 
 
 def _matches_protected_alias(raw_path: str) -> bool:
+    # Lexical alias guard: a symlinked plugin directory resolves OUTSIDE the
+    # protected home, so realpath-only checking would miss it (S2FA).  Any
+    # path spelled through ``.hermes/plugins/<firewall>/`` stays protected
+    # regardless of where the symlink points.
+    raw = posixpath.normpath((raw_path or "").replace("\\", "/"))
+    marker = "/.hermes/plugins/" + FIREWALL_PLUGIN_NAME + "/"
+    if marker in raw or raw.endswith(marker[:-1]):
+        return True
     target = normalize_path(raw_path)
     if not target:
         return True
@@ -651,6 +713,25 @@ def _within_non_persistent_home(path: str, raw_path: str = "") -> bool:
     what matters is where the path actually resolves, not which home the
     process happens to be using.
     """
+    # The exclusion must follow the path's own Hermes home, not only the
+    # currently active one: a relocated HERMES_HOME can point at one scratch
+    # directory while the path under test lives in a sibling scratch tree.
+    raw = posixpath.normpath((raw_path or path or "").replace("\\", "/"))
+    raw_parts = [p for p in raw.split("/") if p]
+    for index, part in enumerate(raw_parts):
+        if part != ".hermes" or index + 1 >= len(raw_parts):
+            continue
+        transient = raw_parts[index + 1]
+        if transient not in _NON_PERSISTENT_HOME_DIRS:
+            continue
+        # A ``.hermes`` tree nested inside the transient dir is a Hermes home
+        # in its own right (a test fixture or a relocated home), not scratch.
+        if ".hermes" in raw_parts[index + 2:]:
+            return False
+        prefix = "/" + "/".join(raw_parts[:index + 2])
+        resolved_prefix = normalize_path(prefix)
+        if resolved_prefix and _within(path, resolved_prefix):
+            return True
     active = normalize_path(_active_hermes_home())
     if not active or not _within(path, active):
         return False
@@ -660,11 +741,6 @@ def _within_non_persistent_home(path: str, raw_path: str = "") -> bool:
     parts = relative.split("/")
     if parts[0] not in _NON_PERSISTENT_HOME_DIRS:
         return False
-    # A ``.hermes`` tree nested inside the transient dir is a Hermes home in
-    # its own right (a test fixture or a relocated home), not scratch data.
-    # The check runs on the UNRESOLVED path too: normalize_path() follows
-    # symlinks, so a protected plugin dir reached through one loses the
-    # ``.hermes`` component entirely.
     raw_relative = (raw_path or path).rstrip("/")[len(active):].lstrip("/")
     raw_parts = [p for p in raw_relative.split("/") if p]
     if ".hermes" in raw_parts[1:]:
@@ -672,11 +748,11 @@ def _within_non_persistent_home(path: str, raw_path: str = "") -> bool:
     return True
 
 
-def is_protected_path(raw_path: str) -> bool:
+def is_protected_path(raw_path: str, cwd: Optional[str] = None) -> bool:
     """True if *raw_path* is a persistent-configuration / credential surface."""
     if not raw_path:
         return False
-    path = normalize_path(raw_path)
+    path = normalize_path(raw_path, cwd)
     if not path:
         return True
     # The RAW path is passed so the transient-dir exclusion can see a
@@ -825,6 +901,7 @@ def extract_endpoint_hosts(text: str) -> List[str]:
     for pattern in (
         _ENDPOINT_ASSIGNMENT_RE,
         _ENDPOINT_PROVIDER_ASSIGNMENT_RE,
+        _SHELL_ENV_ENDPOINT_RE,
     ):
         for match in pattern.finditer(text):
             host = _host_from_url(match.group("url"))
@@ -838,6 +915,80 @@ def extract_endpoint_hosts(text: str) -> List[str]:
             hosts.append(host)
     return hosts
 
+
+
+_MODEL_ENV_KEYS = frozenset({
+    "OPENAI_BASE_URL", "OPENAI_API_BASE", "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_URL", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_BASE",
+    "OLLAMA_HOST", "OLLAMA_BASE_URL", "LITELLM_BASE_URL", "VLLM_BASE_URL",
+    "LITELLM_API_BASE",
+})
+
+
+def _safe_literal_concat(expr: str):
+    """Evaluate only string-literal ``+`` chains; never execute code."""
+    try:
+        node = ast.parse(expr.strip(), mode="eval").body
+    except (SyntaxError, ValueError):
+        return None
+
+    def walk(n):
+        if isinstance(n, ast.Constant) and isinstance(n.value, str):
+            return n.value
+        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add):
+            left, right = walk(n.left), walk(n.right)
+            if left is not None and right is not None:
+                return left + right
+        return None
+
+    return walk(node)
+
+
+def _unresolved_provider_env_assignments(source: str) -> bool:
+    """True when a *known provider* env key/destination is computed, not literal.
+
+    Unrelated SDK variables (for example PAYMENTS_ENDPOINT) are deliberately
+    ignored: this is not a ban on dynamic Python, only unresolved protected
+    destination state.
+    """
+    if not source:
+        return False
+    values = {}
+    for line in source.splitlines():
+        m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$", line)
+        if m:
+            val = _safe_literal_concat(m.group(2))
+            if val is not None:
+                values[m.group(1)] = val
+    for line in source.splitlines():
+        m = re.search(
+            r"os\.environ\s*\[\s*(?P<key>[^\]]+)\]\s*=\s*(?P<val>.+?)\s*$", line
+        )
+        if not m:
+            continue
+        key_expr, val_expr = m.group("key").strip(), m.group("val").strip()
+        key = _safe_literal_concat(key_expr)
+        if key is None:
+            key = values.get(key_expr)
+        if key is None:
+            continue
+        key = key.strip().strip("'\"").upper()
+        if key.startswith("HERMES") and (
+            "ENDPOINT" in key or "BASE_URL" in key or "API_URL" in key or "API_BASE" in key
+        ):
+            is_provider = True
+        else:
+            is_provider = key in _MODEL_ENV_KEYS
+        if not is_provider:
+            continue
+        # A literal key with a literal URL is already enforced by the explicit
+        # BLOCK rule; anything computed is unresolved and must APPROVE.
+        if _safe_literal_concat(val_expr) is None:
+            return True
+        # A computed key is unresolved authorization even with a literal URL.
+        if _safe_literal_concat(key_expr) is None:
+            return True
+    return False
 
 def endpoint_is_allowlisted(host: str) -> bool:
     """True when *host* is an operator-approved endpoint destination.
@@ -1085,9 +1236,9 @@ def is_firewall_own_path(raw_path: str) -> bool:
     return _within(path, own)
 
 
-def is_control_plane_path(raw_path: str) -> bool:
+def is_control_plane_path(raw_path: str, cwd: Optional[str] = None) -> bool:
     """True when *raw_path* is a control-plane surface of the active Hermes home."""
-    path = normalize_path(raw_path)
+    path = normalize_path(raw_path, cwd)
     if not path:
         return False
     if _matches_protected_alias(path):
@@ -1327,15 +1478,135 @@ _PY_SHUTIL_RE = re.compile(
 )
 
 
-def _shell_tokenize(command: str) -> List[str]:
-    """Split a command line into tokens, keeping operators separate.
+def _is_comment_start(text: str, idx: int) -> bool:
+    """POSIX shell: ``#`` begins a comment only at a word boundary.
 
-    ``shlex`` is used as a tokenizer only. It proves nothing about shell
-    semantics - it merely lets the resolver below see ``>``, ``>>``, ``|``
-    and friends as operators instead of gluing them onto a word.
+    A ``#`` inside a word (``foo#bar``, ``https://x/#frag``) is literal
+    data and must not erase the rest of the line -- otherwise a later
+    redirect or ``-o`` destination disappears from policy analysis (R01/R02).
+    """
+    if idx <= 0:
+        return True
+    prev = text[idx - 1]
+    return prev.isspace() or prev in ";|&()<>$\\"
+
+
+def _shell_tokenize(command: str) -> List[str]:
+    """Split a command into tokens, keeping operators (including newlines).
+
+    ``shlex`` with ``punctuation_chars`` treats ``\\n`` as ordinary
+    whitespace, which silently collapses a multi-line script into one
+    segment: a later ``cd`` and a later redirect are then attributed to the
+    first verb.  Newlines are real shell command separators, so they are
+    replaced with ``;`` before tokenization.  Heredoc bodies are blanked out
+    first so their text is never mistaken for commands.
     """
     if not command:
         return []
+    command = command.replace("\r\n", "\n")
+
+    # --- heredoc blanking (quote-aware delimiter) -------------------------
+    # A heredoc body is DATA, not commands; the redirect on its header stays
+    # visible. Delimiters may be quoted and <<- allows tab-indented enders.
+    lines = command.split("\n")
+    heredoc_terms: List[Tuple[str, bool]] = []  # (delimiter, strip_tabs_only)
+    cleaned: List[str] = []
+    _HD = re.compile(
+        r"<<(-?)\s*(?:'([^']+)'|\"([^\"]+)\"|\\([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))"
+    )
+    for line in lines:
+        if heredoc_terms:
+            term, dash = heredoc_terms[-1]
+            candidate = line.lstrip("\t") if dash else line.rstrip("\n")
+            if candidate == term:
+                heredoc_terms.pop()
+            cleaned.append("__PF_HEREDOC_BLANK__")
+            continue
+        cleaned.append(line)
+        in_single = in_double = False
+        scan_at = 0
+        for idx, char in enumerate(line):
+            if char == "\\" and in_double and idx + 1 < len(line):
+                continue  # escaped quote inside double quotes
+            if char == "'" and not in_double:
+                in_single = not in_single
+            elif char == '"' and not in_single:
+                in_double = not in_double
+            elif char == "#" and not in_single and not in_double and _is_comment_start(line, idx):
+                break  # comment starts: no heredoc operator after it
+            elif char == "<" and not in_single and not in_double and line[idx:idx + 2] == "<<":
+                scan_at = idx
+                break
+        m = _HD.search(line, scan_at)
+        if m:
+            term = m.group(2) or m.group(3) or m.group(4) or m.group(5)
+            heredoc_terms.append((term, bool(m.group(1))))
+    # Remove blanked heredoc lines entirely: no newline separator is emitted
+    # for data lines, so only real commands remain in the token stream.
+    cleaned = [line for line in cleaned if line != "__PF_HEREDOC_BLANK__"]
+    command = "\n".join(cleaned)
+
+    # --- quote-aware newline / continuation / comment handling -------------
+    # shlex treats '\n' as whitespace; a global replace corrupts quoted
+    # strings and line continuations. Walk with shell state: unquoted newline
+    # is a separator (';'), backslash-newline (inside or outside quotes) is a
+    # continuation, and an unquoted '#' starts a comment until end of line.
+    out: List[str] = []
+    i = 0
+    size = len(command)
+    quote: str = ""
+    while i < size:
+        char = command[i]
+        if quote == "'":
+            out.append(char)
+            if char == "'":
+                quote = ""
+            i += 1
+            continue
+        if quote == '"':
+            if char == "\\" and i + 1 < size:
+                if command[i + 1] == "\n":
+                    i += 2  # continuation inside double quotes
+                    continue
+                out.append(char)
+                out.append(command[i + 1])
+                i += 2
+                continue
+            out.append(char)
+            if char == '"':
+                quote = ""
+            i += 1
+            continue
+        if char == "'":
+            quote = "'"
+            out.append(char)
+            i += 1
+            continue
+        if char == '"':
+            quote = '"'
+            out.append(char)
+            i += 1
+            continue
+        if char == "#" and _is_comment_start(command, i):
+            while i < size and command[i] != "\n":
+                i += 1
+            continue
+        if char == "\\" and i + 1 < size and command[i + 1] == "\n":
+            i += 2
+            continue
+        if char == "\\" and i + 1 < size:
+            out.append(char)
+            out.append(command[i + 1])
+            i += 2
+            continue
+        if char == "\n":
+            out.append(";")
+            i += 1
+            continue
+        out.append(char)
+        i += 1
+    command = "".join(out)
+
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -1344,9 +1615,9 @@ def _shell_tokenize(command: str) -> List[str]:
         for token in lexer:
             tokens.append(token)
     except ValueError:
-        # Unbalanced quoting: the command cannot be read reliably, so no
-        # destination is claimed from it.
-        return []
+        # FAIL CLOSED: never erase the command. An unparseable command is
+        # marked so the policy treats it as unverifiable rather than benign.
+        return ["__PF_UNPARSEABLE__"] + [t for t in tokens if t]
     return tokens
 
 
@@ -1551,11 +1822,82 @@ def _download_destinations(
     return destinations
 
 
+def _python_string_vars(code: str) -> Dict[str, str]:
+    """Statically resolve ``NAME = 'literal'`` and ``NAME = NAME + 'suffix'``.
+
+    AST parsing is read-only; no snippet code is ever executed (Defect B).
+    """
+    variables: Dict[str, str] = {}
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return variables
+
+    def const(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            return variables.get(node.id)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = const(node.left), const(node.right)
+            return left + right if left is not None and right is not None else None
+        return None
+
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            value = const(node.value)
+            if value is not None:
+                variables[node.targets[0].id] = value
+    return variables
+
+
 def _python_write_destinations(code: str) -> List[str]:
     """The files a Python snippet writes to (literal paths only)."""
     if not code:
         return []
     destinations: List[str] = []
+    variables = _python_string_vars(code)
+
+    # Shell heredoc wrapping Python (nested terminal -> python3 - <<'PY'):
+    # analyze the heredoc body as Python itself.
+    for hd in re.finditer(r"<<\s*['\"]?(?:PY|EOF|END)['\"]?\s*\n([\s\S]*?)\n(?:PY|EOF|END)\s*$", code):
+        body = hd.group(1)
+        variables.update(_python_string_vars(body))
+        destinations.extend(_python_write_destinations(body))
+
+    def expand(value: str) -> str:
+        return variables.get(value.strip(), value)
+
+    def arg_paths(raw: str) -> List[str]:
+        """Quoted literals and bare variable names, statically expanded."""
+        out: List[str] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            m = re.match(r"^(['\"])(.*)\1$", part)
+            if m:
+                out.append(expand(m.group(2)))
+            else:
+                out.append(expand(part))
+        return out
+
+    # Defect B: a nested terminal(...) call inside execute_code is itself a
+    # shell command. Analyze its body with the shell extractor so a dynamic
+    # shutil copy routed through a shell wrapper cannot hide its destination.
+    if "terminal(" in code:
+        for match in re.finditer(r"terminal\s*\(\s*(?:command\s*=\s*)?", code):
+            tail = code[match.end():]
+            quote = next((q for q in ('"""', "'''", '"', "'") if tail.startswith(q)), None)
+            if quote is None:
+                continue
+            end = tail.find(quote, len(quote))
+            if end < 0:
+                continue
+            inner = tail[len(quote):end]
+            destinations.extend(_shell_write_destinations(inner))
+            destinations.extend(_python_write_destinations(inner))
 
     for match in _PY_OPEN_RE.finditer(code):
         mode = match.group(3)
@@ -1567,12 +1909,7 @@ def _python_write_destinations(code: str) -> List[str]:
 
     for match in _PY_OS_RE.finditer(code):
         verb = match.group("verb")
-        paths = [
-            value
-            for _quote, value in re.findall(
-                r"(['\"])([^'\"]+)\1", match.group("args")
-            )
-        ]
+        paths = arg_paths(match.group("args"))
         if verb in ("rename", "replace"):
             destinations.extend(paths)
         elif paths:
@@ -1580,18 +1917,56 @@ def _python_write_destinations(code: str) -> List[str]:
 
     for match in _PY_SHUTIL_RE.finditer(code):
         verb = match.group("verb")
-        paths = [
-            value
-            for _quote, value in re.findall(
-                r"(['\"])([^'\"]+)\1", match.group("args")
-            )
-        ]
+        paths = arg_paths(match.group("args"))
         if verb in ("rmtree", "move"):
             destinations.extend(paths)
         elif paths:
             destinations.append(paths[-1])
 
     return destinations
+
+
+def _python_unresolved_destinations(code: str) -> List[str]:
+    """Write destinations that Python computes dynamically (fail closed).
+
+    Covers ``os.environ[...]``, function calls and other non-literal values
+    passed to file-writing APIs; no snippet code is executed (Defect B).
+    """
+    unresolved: List[str] = []
+    write_calls = ("open", "rename", "replace", "copy", "copy2", "copyfile",
+                   "copytree", "move", "rmtree", "write", "writelines",
+                   "write_text", "write_bytes", "unlink", "mkdir")
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return ["unparseable_python_command"]
+    variables = _python_string_vars(code)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func.id if isinstance(node.func, ast.Name) else (
+            node.func.attr if isinstance(node.func, ast.Attribute) else "")
+        if name not in write_calls:
+            continue
+        # Path.write_text(data, path=dest) and shutil.copy(src, dst=dst):
+        # keyword arguments can carry the destination too (auditor P2).
+        # Path(dst).write_text("x"): the destination sits on the receiver,
+        # not in write_text's arguments (auditor P2).
+        receiver_dest = None
+        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Call):
+            recv_func = node.func.value.func
+            recv_name = recv_func.attr if isinstance(recv_func, ast.Attribute) else (
+                recv_func.id if isinstance(recv_func, ast.Name) else "")
+            if recv_name == "Path" and node.func.value.args:
+                receiver_dest = node.func.value.args[0]
+        for arg in list(node.args) + [kw.value for kw in node.keywords] + ([receiver_dest] if receiver_dest is not None else []):
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                continue
+            if isinstance(arg, ast.Name) and arg.id in variables:
+                continue
+            unresolved.append(name)
+            break
+    return _dedupe(unresolved)
 
 
 def _python_inline_destinations(args: Sequence[str]) -> List[str]:
@@ -1622,46 +1997,103 @@ def _cd_target(args: Sequence[str], cwd: Optional[str]) -> Optional[str]:
         return os.path.expanduser(target)
     if target.startswith("/"):
         return posixpath.normpath(target)
-    base = cwd or os.getcwd()
+    base = cwd
+    if not base:
+        # No statically known execution cwd: an absolute cd target is fine,
+        # a relative one is not statically resolvable.
+        return None
     return posixpath.normpath(posixpath.join(base, target))
 
 
-def _resolve_relative(path: str, cwd: Optional[str]) -> str:
-    """Resolve a relative destination against a statically known directory."""
+def _resolve_relative(path: str, cwd: Optional[str]) -> Tuple[str, bool]:
+    """Resolve a relative destination against a statically known directory.
+
+    Returns ``(path, statically_known)``.  When no execution directory is
+    known, a relative path is NOT joined to the ambient process cwd: an
+    ambient gateway cwd of ``~/.hermes`` would turn ordinary relative writes
+    into protected paths (P0-2).  Such a destination is reported as
+    unresolvable so the caller can fail closed rather than misclassify.
+    """
     if not path:
-        return ""
-    if path.startswith(("/", "~")):
-        return path
+        return "", False
+    if path.startswith(("~",)):
+        return os.path.expanduser(path), True
+    if path.startswith("/"):
+        return posixpath.normpath(path), True
     if cwd:
-        return posixpath.join(cwd, path)
-    return path
+        return posixpath.normpath(posixpath.join(cwd, path)), True
+    return path, False
 
 
-def _shell_write_destinations(command: str, depth: int = 0) -> List[str]:
-    """The files a shell command writes to, when statically resolvable."""
+def _shell_write_destinations(
+    command: str, depth: int = 0, cwd: Optional[str] = None,
+    unresolved: Optional[List[str]] = None,
+) -> List[str]:
+    """The files a shell command writes to, when statically resolvable.
+
+    ``cwd`` is the execution directory supplied by the caller.  Relative
+    destinations are resolved against it; when it is unknown they stay
+    relative rather than being joined to the ambient process cwd (P0-2).
+    ``unresolved``, when provided, receives every destination whose resolution
+    state is False so the policy can apply fail-closed treatment explicitly
+    instead of silently relying on a bare relative path (R04).
+    """
     tokens = _shell_tokenize(command)
     if not tokens:
         return []
 
     destinations: List[str] = []
-    cwd: Optional[str] = None
+    current_cwd: Optional[str] = cwd
     scope: List[Optional[str]] = []
     segment: List[str] = []
+    variables: Dict[str, str] = {}
+    # R05: assignments inside a conditional branch or subshell are not
+    # guaranteed to hold at the point of a later write. Do not let them
+    # resolve destinations as if they were unconditional.
+    guarded_names: set = set()
+    conditional_depth = 0
+    subshell_depth = 0
+    guard_next_assignment = False
+
+    def expand(token: str) -> str:
+        if "$" not in token:
+            return token
+        def repl(match: "re.Match[str]") -> str:
+            name = match.group(1) or match.group(2)
+            if name in guarded_names:
+                return match.group(0)
+            return variables.get(name, match.group(0))
+        return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", repl, token)
 
     def flush() -> None:
-        nonlocal segment, cwd
+        nonlocal segment, current_cwd, guard_next_assignment
         if not segment:
             return
+        # A leading NAME=value assignment defines a shell variable for later
+        # segments (``BASE=/tmp; rm -rf "$BASE"``).  Collect it BEFORE verb
+        # dispatch so bare assignment segments are not skipped.  Assignments
+        # in a conditional branch or subshell are marked guarded (R05).
+        for token in segment:
+            name, sep, value = token.partition("=")
+            if sep and _ENV_ASSIGNMENT_NAME_RE.match(name):
+                variables[name] = expand(value)
+                if conditional_depth or subshell_depth or guard_next_assignment or segment[0] in ("if", "then", "else", "elif", "while", "until", "for", "case"):
+                    guarded_names.add(name)
+            if any(t == "&&" for t in segment):
+                guard_next_assignment = True
         verb, args = _shell_verb(segment)
         if verb == "cd":
-            resolved = _cd_target(args, cwd)
+            resolved = _cd_target(args, current_cwd)
             if resolved is not None:
-                cwd = resolved
+                current_cwd = resolved
         elif verb:
             found = _destinations_for_verb(verb, args, depth)
             found.extend(_redirect_destinations(args))
-            for destination in found:
-                resolved = _resolve_relative(destination, cwd)
+            expanded_found = [expand(d) for d in found]
+            for destination in expanded_found:
+                resolved, known = _resolve_relative(destination, current_cwd)
+                if not known and unresolved is not None:
+                    unresolved.append(resolved)
                 if resolved:
                     destinations.append(resolved)
         segment = []
@@ -1669,15 +2101,30 @@ def _shell_write_destinations(command: str, depth: int = 0) -> List[str]:
     for token in tokens:
         if token == "(":
             flush()
-            scope.append(cwd)
-            cwd = None
+            scope.append(current_cwd)
+            subshell_depth += 1
+            # A subshell inherits the current directory, it does not reset it
+            # to the ambient process cwd.
             continue
         if token == ")":
             flush()
-            cwd = scope.pop() if scope else None
+            current_cwd = scope.pop() if scope else current_cwd
+            subshell_depth = max(0, subshell_depth - 1)
+            continue
+        if token in ("if", "then", "else", "elif", "while", "until", "for", "case"):
+            flush()
+            conditional_depth += 1
+            continue
+        if token == "fi":
+            flush()
+            conditional_depth = max(0, conditional_depth - 1)
             continue
         if token in (";", "&&", "||", "|", "&"):
+            if token in ("&&", "||"):
+                guard_next_assignment = True
             flush()
+            # `&&` guards stay sticky until the next unconditional assignment
+            # is consumed; a bare `;` does not prove the branch ran.
             continue
         segment.append(token)
     flush()
@@ -2138,7 +2585,9 @@ _AMBIGUOUS_DEST_VERBS: Tuple[str, ...] = (
 )
 
 
-def _ambiguous_protected_write(tool_name: str, args: Any) -> Optional[str]:
+def _ambiguous_protected_write(
+    tool_name: str, args: Any, cwd: Optional[str] = None
+) -> Optional[str]:
     """A protected path a mutating command names but cannot attribute.
 
     Some writes cannot be resolved to a destination: an unknown option, a
@@ -2149,6 +2598,8 @@ def _ambiguous_protected_write(tool_name: str, args: Any) -> Optional[str]:
 
     A path that is only *mentioned* - as the source of a copy, or as an
     argument of an interpreter - is not a write attempt and stays allowed.
+    Relative operands are resolved against *cwd* when it is known; they are
+    never silently joined to the ambient process cwd (P0-2).
     """
     for text, is_python in _exec_texts(tool_name, args):
         if is_python:
@@ -2156,7 +2607,42 @@ def _ambiguous_protected_write(tool_name: str, args: Any) -> Optional[str]:
         segments = _shell_segments(text)
         if not segments:
             continue
+        if any(t == "__PF_UNPARSEABLE__" for segment in segments for t in segment):
+            # Tokenizer could not parse the command: never allow silently.
+            return "unparseable_shell_command"
+        # Track simple NAME=value assignments so ``BASE=/tmp; tar ... "$BASE"``
+        # is classified by its actual target.
+        variables: Dict[str, str] = {}
+        guarded_names: set = set()
+
+        def expand(token: str) -> str:
+            if "$" not in token:
+                return token
+            def repl(match: "re.Match[str]") -> str:
+                name = match.group(1) or match.group(2)
+                if name in guarded_names:
+                    return match.group(0)
+                return variables.get(name, match.group(0))
+            return re.sub(
+                r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+                repl, token,
+            )
+
+        subshell_depth = 0
+        conditional_depth = 0
         for segment in segments:
+            head = segment[0] if segment else ""
+            if head in ("(", ")"):
+                subshell_depth += 1 if head == "(" else -1
+                subshell_depth = max(0, subshell_depth)
+            if head in ("if", "then", "else", "elif", "while", "until", "for", "case"):
+                conditional_depth += 1
+            for token in segment:
+                name, sep, value = token.partition("=")
+                if sep and _ENV_ASSIGNMENT_NAME_RE.match(name):
+                    variables[name] = expand(value)
+                    if conditional_depth or subshell_depth or head in ("then", "else", "elif") or "&&" in segment:
+                        guarded_names.add(name)
             verb, verb_args = _shell_verb(segment)
             if not verb or verb not in _AMBIGUOUS_DEST_VERBS:
                 continue
@@ -2169,9 +2655,16 @@ def _ambiguous_protected_write(tool_name: str, args: Any) -> Optional[str]:
             if _segment_destinations(segment):
                 continue
             for operand in _shell_operands(verb_args, _verb_options(verb)):
-                if not _looks_like_path(operand):
+                resolved_operand = expand(operand)
+                if not _looks_like_path(resolved_operand):
                     continue
-                if is_protected_path(operand) or is_control_plane_path(operand):
+                if not resolved_operand.startswith(("/", "~")) and not cwd:
+                    # Without a known execution cwd, a relative operand cannot
+                    # be classified as a protected path. Do NOT resolve it
+                    # against the ambient gateway directory.
+                    continue
+                checked = normalize_path(resolved_operand, cwd)
+                if is_protected_path(checked) or is_control_plane_path(checked):
                     return operand
     return None
 
@@ -2303,21 +2796,59 @@ def _exec_texts(tool_name: str, args: Any) -> List[Tuple[str, bool]]:
     return texts
 
 
-def extract_exec_write_destinations(tool_name: str, args: Any) -> List[str]:
+def extract_exec_write_destinations(tool_name: str, args: Any, cwd: Optional[str] = None) -> List[str]:
     """The files an executable call writes to, when statically resolvable.
 
     Covers shell redirection, in-place editors, copy/move/link/install,
     ``tee``, downloads, explicit Python writes and - where the working
-    directory is statically known - relative destinations. Read-only
-    commands contribute nothing.
+    directory is statically known - relative destinations.
+
+    ``cwd`` is the execution directory supplied by the caller. Relative
+    destinations are resolved against it, never against the ambient process
+    cwd (P0-2).
     """
     destinations: List[str] = []
+    unresolved: List[str] = []
     for text, is_python in _exec_texts(tool_name, args):
         if is_python:
             destinations.extend(_python_write_destinations(text))
         else:
-            destinations.extend(_shell_write_destinations(text))
+            destinations.extend(_shell_write_destinations(text, cwd=cwd, unresolved=unresolved))
     return _dedupe(destinations)
+
+
+def extract_unresolved_write_destinations(
+    tool_name: str, args: Any, cwd: Optional[str] = None
+) -> List[str]:
+    """Shell destinations that could not be resolved to a known directory.
+
+    R04: the resolution-state boolean from ``_resolve_relative`` must reach
+    policy.  Callers can fail closed on these paths instead of treating a
+    bare relative string as if it were a resolved absolute path.
+    """
+    unresolved: List[str] = []
+    for text, is_python in _exec_texts(tool_name, args):
+        if is_python:
+            unresolved.extend(_python_unresolved_destinations(text))
+            continue
+        _shell_write_destinations(text, cwd=cwd, unresolved=unresolved)
+    return _dedupe(unresolved)
+
+
+def extract_call_cwd(args: Any) -> Optional[str]:
+    """Best-effort extraction of a tool call's execution cwd.
+
+    Terminal tools may carry an explicit ``workdir`` or ``cwd`` argument.
+    An empty or non-string value yields no cwd, so relative paths stay
+    unresolved rather than being attributed to the ambient gateway cwd.
+    """
+    if not isinstance(args, dict):
+        return None
+    for key in ("workdir", "cwd", "command_cwd", "execution_cwd"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def extract_shell_write_targets(command: str) -> List[str]:
@@ -2966,7 +3497,9 @@ def _evaluate_scoped_call(tool_name: str, args: Any) -> Verdict:
     )
 
 
-def evaluate_tool_call(tool_name: str, args: Any, *, grant: Any = None) -> Verdict:
+def evaluate_tool_call(
+    tool_name: str, args: Any, *, grant: Any = None, cwd: Optional[str] = None
+) -> Verdict:
     """Evaluate a single tool call against the trust boundary.
 
     Returns a :class:`Verdict`. ``block`` means the call must not execute.
@@ -2977,11 +3510,17 @@ def evaluate_tool_call(tool_name: str, args: Any, *, grant: Any = None) -> Verdi
     a single-target atomic ``write_file`` whose content hash matches the
     authorized hash. Every other rule runs unchanged; the grant never short-
     circuits the rest of this evaluation.
+
+    ``cwd`` is the execution directory of this call. It is used to resolve
+    relative shell destinations; when it is absent, relative writes are not
+    attributed to the ambient gateway cwd (P0-2).
     """
     name = (tool_name or "").lower()
     content = _arg_text(args)
     command = extract_command_text(name, args)
     targets = extract_target_paths(name, args)
+    if cwd is None:
+        cwd = extract_call_cwd(args)
 
     # ------------------------------------------------------------------ #
     # 0. Argument-scoped tools.
@@ -3029,23 +3568,65 @@ def evaluate_tool_call(tool_name: str, args: Any, *, grant: Any = None) -> Verdi
     #    phrase, not on the phrase being present at all.
     # ------------------------------------------------------------------ #
     disable_hit = _first_finding(findings, (CATEGORY_SECURITY_DISABLE,))
-    if name in EXEC_TOOLS and _disables_firewall_plugin(scan_source):
+    _exec_source = executable_command_view(scan_source, name)
+    if name in EXEC_TOOLS and _unresolved_provider_env_assignments(_exec_source):
         return Verdict(
-            action="block",
-            reason="security_control_disable",
-            detail="Blocked: disabling prompt-firewall through Hermes plugin management is not permitted.",
+            action="approve",
+            reason="destination_unresolved",
+            detail="Approval required: provider destination is computed and not resolvable at policy time.",
             findings=tuple(findings),
         )
+    if name in EXEC_TOOLS and re.search(
+        r"(?i)\bhermes\s+config\s+set\s+"
+        r"(?:\S+\.)?(?:api_base|api_url|base_url|endpoint|providers?\.\S+\.api)\b",
+        _exec_source,
+    ):
+        for _m in re.finditer(r"https?://[^\s\"'<>]+", scan_source):
+            _h = urllib.parse.urlsplit(_m.group(0)).hostname or ""
+            if _h and not endpoint_is_allowlisted(_h):
+                return Verdict(
+                    action="block",
+                    reason="gateway_redirect_exec",
+                    detail=("Blocked: command redirects the model endpoint to "
+                            f"non-allowlisted host {_h.lower()}."),
+                    findings=tuple(findings),
+                )
+
+    if name in EXEC_TOOLS:
+        for _m in re.finditer(
+            r"(?i)os\.environ\s*\[\s*['\"]"
+            r"(?:OPENAI_BASE_URL|OPENAI_API_BASE|ANTHROPIC_BASE_URL|"
+            r"ANTHROPIC_API_URL|AZURE_OPENAI_ENDPOINT|AZURE_OPENAI_API_BASE|"
+            r"HERMES[A-Z0-9_]*(?:ENDPOINT|BASE_URL|API_URL|API_BASE)|"
+            r"OLLAMA_HOST|OLLAMA_BASE_URL|LITELLM_BASE_URL|VLLM_BASE_URL|"
+            r"LITELLM_API_BASE)"
+            r"['\"]\s*]\s*=\s*['\"]([^'\"]+)['\"]",
+            _exec_source,
+        ):
+            _h = urllib.parse.urlsplit(_m.group(1)).hostname or ""
+            if _h and not endpoint_is_allowlisted(_h):
+                return Verdict(
+                    action="block",
+                    reason="gateway_redirect_exec",
+                    detail=f"Blocked: source redirects the model endpoint to non-allowlisted host {_h}.",
+                    findings=tuple(findings),
+                )
+
+    if name in EXEC_TOOLS and _disables_firewall_plugin(scan_source):
+        return dispatch_decision(
+            veto_reason="security_control_disable",
+            veto_detail="Blocked: disabling prompt-firewall through Hermes plugin management is not permitted.",
+            findings=findings,
+        )
     if disable_hit and _is_real_control_disable(name, targets, scan_source):
-        return Verdict(
-            action="block",
-            reason="security_control_disable",
-            detail=(
+        return dispatch_decision(
+            veto_reason="security_control_disable",
+            veto_detail=(
                 "Blocked: the tool call tries to disable security controls "
                 f"(pattern {disable_hit.pattern}). The firewall cannot be "
                 "switched off from inside a tool call."
             ),
-            findings=tuple(findings),
+            findings=findings,
         )
 
     # ------------------------------------------------------------------ #
@@ -3071,7 +3652,7 @@ def evaluate_tool_call(tool_name: str, args: Any, *, grant: Any = None) -> Verdi
         # write tool that persists it must not be waved through. A control
         # *phrase* is different - it names no instruction and only the
         # disable rule below judges whether the action is real (PF-12).
-        if injection.category != CATEGORY_SECURITY_DISABLE:
+        if not targets and injection.category != CATEGORY_SECURITY_DISABLE:
             return Verdict(
                 action="block",
                 reason="nested_argument_injection",
@@ -3115,6 +3696,7 @@ def evaluate_tool_call(tool_name: str, args: Any, *, grant: Any = None) -> Verdi
                 # code/config/state paths. Such a surface stays fail-closed BLOCK
                 # regardless of any grant (an APPROVE could be auto-approved).
                 if canon and not is_firewall_state_surface(canon) \
+                        and "/plugins/" + FIREWALL_PLUGIN_NAME + "/" not in canon \
                         and _g.grant_matches(grant[0], grant[1], canon, content_arg):
                     # Lift ONLY this denial; do NOT allow yet. Fall through so all
                     # remaining policy checks run. Consumption happens at the end.
@@ -3213,46 +3795,62 @@ def evaluate_tool_call(tool_name: str, args: Any, *, grant: Any = None) -> Verdi
     if name in EXEC_TOOLS or (
         name not in KNOWN_TOOLS and _has_exec_payload(args)
     ):
-        write_targets = extract_exec_write_destinations(name, args)
+        write_targets = extract_exec_write_destinations(name, args, cwd=cwd)
         protected_exec = [
             t
             for t in write_targets
-            if is_protected_path(t) or is_control_plane_path(t)
+            if (is_protected_path(t, cwd)
+                or is_control_plane_path(t, cwd)
+                or is_durable_instruction_surface(t))
         ]
         if not protected_exec:
             # A segment that names a protected surface without a resolvable
             # destination is escalated on its own. The check is per segment:
             # a benign resolved write elsewhere in the same command must not
             # mask an unverifiable protected write.
-            ambiguous = _ambiguous_protected_write(name, args)
+            ambiguous = _ambiguous_protected_write(name, args, cwd=cwd)
             if ambiguous:
                 return Verdict(
                     action="approve",
                     reason="protected_write_unverifiable",
                     detail=(
                         "Approval required: this command writes to the "
-                        f"protected path {normalize_path(ambiguous)!r}, but "
+                        f"protected path {normalize_path(ambiguous, cwd)!r}, but "
                         "the firewall cannot resolve where the write lands."
                     ),
                     rule_key=(
                         "prompt-firewall.protected-write:"
-                        f"{normalize_path(ambiguous)}"
+                        f"{normalize_path(ambiguous, cwd)}"
                     ),
+                    findings=tuple(findings),
+                )
+            # R04: unresolved relative destinations must reach policy, not
+            # remain dead code in the extraction helper. A relative target
+            # with no trusted execution cwd cannot be proven benign.
+            unresolved = extract_unresolved_write_destinations(name, args, cwd=cwd)
+            if unresolved:
+                return Verdict(
+                    action="approve",
+                    reason="destination_unresolved",
+                    detail=(
+                        "Approval required: the write destination cannot be "
+                        f"resolved to a known directory: {unresolved[0]!r}."
+                    ),
+                    rule_key="prompt-firewall.unresolved-destination",
                     findings=tuple(findings),
                 )
         if protected_exec:
             exec_target = protected_exec[0]
             if injection:
-                return Verdict(
-                    action="block",
-                    reason="protected_write_with_injection",
-                    detail=(
+                return dispatch_decision(
+                    veto_reason="protected_write_with_injection",
+                    veto_detail=(
                         "Blocked: refused to write to protected path "
                         f"{normalize_path(exec_target)!r} because the request "
                         f"carries an injection signature (pattern "
                         f"{injection.pattern})."
                     ),
-                    findings=tuple(findings),
+                    findings=findings,
                 )
             if is_credential_path(exec_target):
                 return Verdict(
@@ -3371,15 +3969,14 @@ def evaluate_tool_call(tool_name: str, args: Any, *, grant: Any = None) -> Verdi
                 )
             return Verdict(action="allow", reason="protected_read")
         if injection:
-            return Verdict(
-                action="block",
-                reason="protected_write_with_injection",
-                detail=(
+            return dispatch_decision(
+                veto_reason="protected_write_with_injection",
+                veto_detail=(
                     "Blocked: refused to write to protected path "
                     f"{target!r} because the content carries an injection "
                     f"signature (pattern {injection.pattern})."
                 ),
-                findings=tuple(findings),
+                findings=findings,
             )
         if is_credential_path(target):
             return Verdict(
@@ -3415,10 +4012,15 @@ def evaluate_tool_call(tool_name: str, args: Any, *, grant: Any = None) -> Verdi
                 from . import grants as _g
                 surfaces = [t for t in targets if is_durable_instruction_surface(t)]
                 content_arg = args.get("content") if isinstance(args, dict) else None
-                if len(surfaces) == 1 and _g.grant_matches(
+                if len(surfaces) == 1 and not any(
+                        is_firewall_state_surface(t)
+                        or "/plugins/" + FIREWALL_PLUGIN_NAME + "/" in normalize_path(t)
+                        for t in surfaces
+                ) and _g.grant_matches(
                         grant[0], grant[1], normalize_path(target), content_arg):
                     # Authorized exact write: fall through to the remaining
                     # checks instead of returning the instruction-surface block.
+                    # Firewall-owned state is NEVER grant-downgradable (R07/P0).
                     pass
                 else:
                     return Verdict(
@@ -3560,9 +4162,94 @@ def evaluate_tool_call(tool_name: str, args: Any, *, grant: Any = None) -> Verdi
                 )
         # A command that binds an endpoint key to a URL really does switch
         # the endpoint, so it is enforced here (not only for writes).
-        if mentions_endpoint_change(command):
-            hosts = extract_endpoint_hosts(command)
-            bad = [h for h in hosts if not endpoint_is_allowlisted(h)]
+        # `hermes config set ... <url>` is an explicit control-plane mutation
+        # even when the URL is not written in config-key notation.
+        command_ctx = ActionContext(
+            tool_name=name,
+            args=args if isinstance(args, dict) else {},
+            cwd=cwd,
+            command=command or "",
+        ) if ActionContext is not None else None
+        _command_text = executable_command_view(
+            command_ctx.command if command_ctx else command, name
+        )
+        if re.search(
+            r"(?i)\bhermes\s+config\s+set\s+"
+            r"(?:\S+\.)?(?:api_base|api_url|base_url|endpoint|"
+            r"providers?\.\S+\.api)\b",
+            _command_text,
+        ):
+            _cli_hosts = []
+            for _m in re.finditer(r"https?://[^\s\"'<>]+", _command_text):
+                _h = urllib.parse.urlsplit(_m.group(0)).hostname or ""
+                if _h and not endpoint_is_allowlisted(_h):
+                    _cli_hosts.append(_h.lower())
+            if _cli_hosts:
+                return Verdict(
+                    action="block",
+                    reason="gateway_redirect_exec",
+                    detail=("Blocked: command redirects the model endpoint to "
+                            f"non-allowlisted host(s) {', '.join(sorted(set(_cli_hosts)))}."),
+                    findings=tuple(findings),
+                )
+
+        _literal_vars_g5 = {}
+        for _ln in _command_text.splitlines():
+            _mm = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*['\"]([^'\"]+)['\"]\s*$", _ln)
+            if _mm:
+                _literal_vars_g5[_mm.group(1)] = _mm.group(2)
+        for _m5 in re.finditer(
+            r"(?i)os\.environ\s*\[\s*['\"]"
+            r"(?:OPENAI_BASE_URL|OPENAI_API_BASE|ANTHROPIC_BASE_URL|"
+            r"ANTHROPIC_API_URL|AZURE_OPENAI_ENDPOINT|AZURE_OPENAI_API_BASE|"
+            r"HERMES[A-Z0-9_]*(?:ENDPOINT|BASE_URL|API_URL|API_BASE))"
+            r"['\"]\s*]\s*=\s*([A-Za-z_][A-Za-z0-9_]*)",
+            _command_text,
+        ):
+            _var5 = _m5.group(1)
+            if _var5 not in _literal_vars_g5:
+                return Verdict(
+                    action="approve",
+                    reason="destination_unresolved",
+                    detail=f"Approval required: unresolved provider value {_var5!r}.",
+                    findings=tuple(findings),
+                )
+            _h5 = urllib.parse.urlsplit(_literal_vars_g5[_var5]).hostname or ""
+            if _h5 and not endpoint_is_allowlisted(_h5):
+                return Verdict(
+                    action="block",
+                    reason="gateway_redirect_exec",
+                    detail=f"Blocked: provider endpoint redirected to non-allowlisted host {_h5}.",
+                    findings=tuple(findings),
+                )
+
+        if mentions_endpoint_change(_command_text):
+            # A commented-out source line is data, not an executable redirect.
+            executable_lines = [
+                "" if line.lstrip().startswith("#") else line
+                for line in _command_text.splitlines()
+            ]
+            bad = []
+            for _line in executable_lines:
+                if not _line.strip():
+                    continue
+                # Per-line provenance: a plain source assignment is data.
+                # Control-plane assignments/commands are never waived.
+                _plain_assign = bool(re.match(
+                    r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[\"'][^\"']+[\"']\s*$",
+                    _line,
+                ))
+                _control = bool(re.search(
+                    r"(?i)hermes\s+config|export\s+[A-Z0-9_]*"
+                    r"(?:BASE_URL|API_URL|ENDPOINT)|providers\.|"
+                    r"os\.environ[^=]*=\s*[\"']?https?://",
+                    _line,
+                ))
+                if name == "execute_code" and _plain_assign and not _control:
+                    continue
+                _hs = extract_endpoint_hosts(_line)
+                bad.extend(h for h in _hs if not endpoint_is_allowlisted(h))
+            bad = sorted(set(bad))
             if bad:
                 return Verdict(
                     action="block",
@@ -3571,6 +4258,36 @@ def evaluate_tool_call(tool_name: str, args: Any, *, grant: Any = None) -> Verdi
                         "Blocked: command redirects the model endpoint to "
                         f"non-allowlisted host(s) {', '.join(sorted(bad))}."
                     ),
+                    findings=tuple(findings),
+                )
+
+    # Writes into a model-endpoint config file really do redirect the gateway.
+    if name in WRITE_TOOLS:
+        action_ctx = ActionContext(
+            tool_name=name,
+            args=args if isinstance(args, dict) else {},
+            cwd=cwd,
+            targets=tuple(str(t) for t in targets),
+            command=command or "",
+            content=content or "",
+        ) if ActionContext is not None else None
+        config_targets = [
+            t for t in (action_ctx.target_paths() if action_ctx else targets)
+            if posixpath.basename(str(t)) in ENDPOINT_CONFIG_BASENAMES
+            and (
+                is_control_plane_path(str(t), cwd)
+                or (not cwd and posixpath.dirname(str(t)) in ("", "."))
+            )
+        ]
+        if config_targets:
+            hosts = extract_endpoint_hosts(json.dumps(args))
+            bad = [h for h in hosts if not endpoint_is_allowlisted(h)]
+            if bad:
+                return Verdict(
+                    action="block",
+                    reason="gateway_redirect_write",
+                    detail=("Blocked: write redirects the model endpoint to "
+                            f"non-allowlisted host(s) {', '.join(sorted(bad))}."),
                     findings=tuple(findings),
                 )
 

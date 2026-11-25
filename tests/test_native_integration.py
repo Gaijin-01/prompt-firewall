@@ -78,7 +78,10 @@ class NativeIntegrationTest(unittest.TestCase):
         discover_plugins(force=True)
 
         cls.loaded = {p["name"]: p for p in get_plugin_manager().list_plugins()}
-        cls.audit_log = cls.home / "logs" / "prompt-firewall.jsonl"
+        # Mode routing (PROMPT_FIREWALL_MODE) decides the suffix; ask the
+        # plugin itself so the assertion follows the documented contract.
+        from pfplugin_under_test import _audit_path
+        cls.audit_log = Path(_audit_path())
 
     @classmethod
     def tearDownClass(cls) -> None:
