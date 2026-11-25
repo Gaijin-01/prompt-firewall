@@ -42,9 +42,20 @@ The plugin registers exactly three hooks, and nothing else:
 | `pre_tool_call` | evaluates a risky tool action and can return `block` or `approve` |
 | `pre_llm_call` | states the trust boundary in the operator's turn |
 
-It registers no tools, no middleware and no provider profiles. It reads no credential stores. Two environment variables are read, and they are not equivalent: `HERMES_LANGUAGE` changes presentation only, while `HERMES_HOME` selects the active Hermes root and therefore the protected-path set.
+It registers no tools, no middleware and no provider profiles.
 
-`HERMES_LANGUAGE` selects the language of the approval card (section 4); it never influences a verdict. `HERMES_HOME` selects the active Hermes root - the home whose configuration, plugin directory and audit log are protected - so it does affect protected-path classification and can change the verdict for a path inside that home.
+### Environment reads
+
+The plugin reads the following environment variables at runtime. They are not all presentation-only; their exact influence is listed here.
+
+| Variable | Required? | Influence |
+|---|---|---|
+| `HERMES_HOME` | optional | Selects the active Hermes root. Changes the protected-path set and therefore path classification and verdicts. Without it, the plugin asks `hermes_cli.config` and finally falls back to `~/.hermes`. |
+| `HERMES_LANGUAGE` | optional | Presentation only: selects the approval-card language. Never changes a verdict. |
+| `PROMPT_FIREWALL_MODE` | optional | Defaults to `runtime`. Any other value routes the audit sink to a mode-suffixed sibling file so test/probe runs cannot contaminate the live audit trail. Changes audit destination, not verdicts. |
+| `PROMPT_FIREWALL_AUDIT_LOG` | optional | Explicit audit-log destination; overrides both mode-based routing and `HERMES_HOME`. Changes where audit records are written. |
+| `HERMES_SESSION_ID` | optional | Session attribution copied into audit records when the hook payload does not provide a session id. |
+| `<PLATFORM>_ALLOWED_USERS` | optional but authorization-critical | Gateway allowlist for a user-facing platform (for example `TELEGRAM_ALLOWED_USERS`). Used by `grants.py` to verify that a grant request comes from a configured authorized operator. Unset or empty means no operator is authorized and grants fail closed. Never derived from message text. |
 
 ## What it does
 
@@ -123,15 +134,33 @@ Only metadata is recorded - reason code, source label, pattern ids. File content
 
 ## Evidence and verification status
 
-The source checkout carries an automated regression suite. The published runtime tree described below contains no tests, audit logs or research artifacts.
+The public tree contains **22 files**: 15 runtime/document files plus **7 retained test files**. Git reports **23 tree entries** because `tests/` is itself counted as one tree entry. Audit logs, benchmark corpora, vendored Core test dependencies and research artifacts are not in the public tree; they live in a separate private audit package.
 
-Verification performed on the release candidate (see the private audit package for raw logs):
+Verification has three distinct scopes. Do not conflate them:
 
-- Full regression suite: 557 passed.
-- Native three-hook compatibility: 14 passed against an isolated Hermes plugin manager.
-- Focused security regressions: 39 passed.
-- Performance: no material relative p95/p99 regression versus v1.1.7. One pre-registered absolute budget (p95 of `transform_tool_result` <= 20 ms on a corpus containing two 200,000-character outputs) is **FAIL at 309 ms** for the candidate *and for both earlier versions*. This is a property of the scan budget, not a regression introduced in 1.1.8.
-- Independent exact-SHA review of the release tree is pending; publication is not authorized by this package.
+| Scope | Prerequisites | Result |
+|---|---|---|
+| Complete pre-extraction candidate suite | Full source checkout with vendored Hermes Core test dependencies | 557 passed |
+| Public retained suite, with Hermes Core | Public tree plus a Hermes Core checkout providing `hermes_cli` | **298 passed** |
+| Public retained suite, without Hermes Core | Public tree only | **284 passed**; 14 Core-dependent cases cannot run |
+
+Reproduce the public results:
+
+```bash
+# with Hermes Core available on PYTHONPATH
+python3 -m pytest -q tests --import-mode=importlib -p no:cacheprovider
+
+# without Hermes Core (14 native cases error/fail at setup: hermes_cli is absent)
+python3 -m pytest -q tests --import-mode=importlib -p no:cacheprovider
+```
+
+The 557-pass result belongs to the **complete pre-extraction candidate suite**, not to this minimal public tree. It is preserved as historical verification evidence, not claimed as a current result of the public tree.
+
+Native three-hook compatibility: 14 passed when Hermes Core is available. Focused security regressions (P0-A, P0-B, P0-2, scoped grants): all passed in the retained suite; raw logs are in the private audit package.
+
+Performance: no material relative p95/p99 regression versus v1.1.7 (candidate p95 +0.33%, p99 -0.56% on the shared harness). No formal statistical equivalence test was run; equivalence is therefore **not claimed**. One pre-registered absolute budget (p95 of `transform_tool_result` <= 20 ms on a corpus containing two 200,000-character outputs) is **FAIL at 309 ms** for the candidate *and for both earlier versions* (v1.1.7: 308 ms, v1.1.6: 512 ms). This is a property of the scan budget, not a regression introduced in 1.1.8.
+
+Independent exact-SHA review of the release tree is pending; publication is not authorized by this package.
 
 AgentDojo-style adapter study (historical, 1.1.6-era, not a 1.1.8 enforcement claim): 160 matched banking attack pairs on one free model; attacker success 6/160 with the adapter off versus 0/160 with a tool-result-quarantine adapter on; legitimate-task utility 89/160 versus 87/160. Only 5 of 16 banking tasks were sampled, the on-arm did not exercise the Core action gate, 40 pairs were lost to a harness error, and run-to-run variance was not measured. These numbers are context only, not a general protection rate.
 
@@ -160,7 +189,7 @@ No release of this plugin provides complete protection. The following gaps are p
 
 ## Scope of the published tree
 
-The published tree contains the runtime files only: `plugin.yaml`, `__init__.py`, `action_context.py`, `detectors.py`, `executable_view.py`, `explain.py`, `grants.py`, `locale.py`, `policy.py`, `strings.py`, `README.md`, `CHANGELOG.md`, `SECURITY_LIMITATIONS.md` and `LICENSE`. No test, audit, benchmark or development-only file is part of it. The source checkout carries the full suite and the private audit package carries the raw evidence.
+The published tree contains 22 files (23 Git tree entries, counting the `tests/` directory): `plugin.yaml`, `__init__.py`, `action_context.py`, `detectors.py`, `executable_view.py`, `explain.py`, `grants.py`, `pf_locale.py`, `policy.py`, `strings.py`, `README.md`, `CHANGELOG.md`, `SECURITY_LIMITATIONS.md`, `LICENSE`, `.gitignore` and 7 retained regression files under `tests/`. Audit, benchmark and development-only files are not part of it; they live in a separate private audit package.
 
 ## Bounded shell semantics
 

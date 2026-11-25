@@ -942,7 +942,7 @@ def _approval_card_message(tool_name: str, args: Any, verdict: Verdict, rule_key
     )
     try:
         from .explain import explain_command, explain_tool_call, render_card
-        from .locale import detect_language
+        from .pf_locale import detect_language
         language = detect_language(session_key)
         command = extract_command_text(tool_name, args)
         if command:

@@ -24,8 +24,14 @@ Plugin-only update of the deterministic firewall. Baseline: published v1.1.7. No
 - OS-backed monotonic trust, same-UID isolation, D12 rollback guarantees and native Core enforcement are not claimed or implemented by this release.
 
 ### Verification
-- 557 regression tests passed; 14 native three-hook compatibility tests passed; 39 focused security tests passed. Raw logs are in the private audit package.
-- Performance: no material relative p95/p99 regression versus v1.1.7. The pre-registered absolute transform-tool-result p95 budget of 20 ms on a 200K-character corpus is FAIL at 309 ms for this candidate and for 1.1.7 and 1.1.6 alike; reported as a scan-budget limitation, not a 1.1.8 regression.
+- Public retained suite with Hermes Core: 298 passed; without Hermes Core: 284 passed, with 14 Core-dependent cases unable to run.
+- The historical 557-pass full suite belongs to the complete pre-extraction candidate, not to this minimal public tree; it is preserved as historical evidence and is not claimed as a public-tree result.
+- Performance: no material relative p95/p99 regression versus v1.1.7 (candidate p95 +0.33%, p99 -0.56%). No statistical equivalence test was run; equivalence is not claimed. The pre-registered absolute transform-tool-result p95 budget of 20 ms on a 200K-character corpus is FAIL at 309 ms for this candidate and for 1.1.7 (308 ms) and 1.1.6 (512 ms) alike; reported as a scan-budget limitation, not a 1.1.8 regression.
+
+### Final cleanup
+- Renamed `locale.py` to `pf_locale.py` to avoid shadowing Python's stdlib `locale` when the plugin root is early in `sys.path`; localization behavior and all three hook contracts are unchanged.
+- Replaced personal paths in retained bypass fixtures with portable `tmp_path` fixtures; no fixture payload is executed.
+- Corrected documentation to distinguish the 22-file public tree (23 Git tree entries) from the complete pre-extraction candidate, and disclosed all runtime environment reads.
 
 ## 1.1.7 (published release, 2026-11-19)
 
