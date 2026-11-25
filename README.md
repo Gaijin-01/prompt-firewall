@@ -1,3 +1,5 @@
+> **Current published release: 1.1.8.** The reviewed, pinned source is commit `12e8199b38ef120311eeb0c66e583f773be2eef1` on branch `release/1.1.8`, tagged `v1.1.8`. GitHub release: https://github.com/Gaijin-01/prompt-firewall/releases/tag/v1.1.8. Marketplace catalog update: https://github.com/NousResearch/hermes-agent/pull/159993 (open, awaiting maintainer review). This `main` branch is kept as the historical 1.1.4 line; it is not the published 1.1.8 source. The 1.1.8 release discloses B2 FAIL (p95 309 ms vs the 20 ms absolute budget, accepted as a documented exception, not a PASS).
+
 # prompt-firewall
 
 A deterministic prompt-injection firewall for [Hermes Agent](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins).
