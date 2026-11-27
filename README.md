@@ -153,8 +153,8 @@ Verification has three distinct scopes. Do not conflate them:
 | Scope | Prerequisites | Result |
 |---|---|---|
 | Complete pre-extraction candidate suite | Full source checkout with vendored Hermes Core test dependencies | 557 passed (historical, 1.1.8-era) |
-| Public retained suite, with Hermes Core | Public tree plus a Hermes Core checkout providing `hermes_cli` | **337 passed** for 1.1.9 (298 in 1.1.8 + 21 new + 7 cache-isolation controls + 11 surrogate eq.) |
-| Public retained suite, without Hermes Core | Public tree only, `hermes_cli` not importable | **305 passed**; 14 Core-dependent cases cannot run (13 error at setup, 1 fails) |
+| Public retained suite, with Hermes Core | Public tree plus a Hermes Core checkout providing `hermes_cli` | **337 passed** for 1.1.9 (323 standalone + 14 Core-dependent cases exercised in the available Core environment) |
+| Public retained suite, without Hermes Core | Public tree only, `hermes_cli` not importable | **323 passed**; 14 Core-dependent cases are **NOT VERIFIED independently** |
 
 Reproduce the public results:
 
@@ -172,11 +172,11 @@ The 557-pass result belongs to the **complete pre-extraction candidate suite**, 
 
 Native three-hook compatibility: 13 passed when Hermes Core is available (Core `0bf92a126102d274ff2d6a839cf8b83ab75ac3d0`), exercised through Hermes' own plugin discovery and hook dispatcher.
 
-Performance: the 1.1.9 scanner brings the pooled p95 of `transform_tool_result` on the original archived B2 corpus (11 result cells, 300 measured samples each, fixed CPU affinity, one child process per variant) to the mid-teens of milliseconds, against roughly 309 ms for published v1.1.8. The pre-registered absolute budget (p95 <= 20 ms on that corpus) is therefore **met** for 1.1.9, where it was **FAIL at 309 ms** for 1.1.8. The measured numbers, the raw samples and the actual chars/s are in the release dossier. This is a property of the scanned corpus, **not** a universal latency bound: a large finding-bearing document is still slower than a benign one. No formal statistical equivalence test was run, so equivalence is **not claimed**.
+Performance: the 1.1.9 scanner brings the pooled p95 of `transform_tool_result` on the original archived B2 corpus (11 result cells, 300 measured samples each, fixed CPU affinity, one child process per variant) to **17.8490 ms**, against **317.3259 ms** for published v1.1.8; p99 is **19.3100 ms** and maximum **40.2212 ms**. The pre-registered absolute budget (p95 <= 20 ms on that corpus) is therefore **met** for 1.1.9. The maximum is not a universal sub-20 ms bound. The measured numbers, the raw samples and the actual chars/s are in the release dossier. This is a property of the scanned corpus, **not** a universal latency bound: a large finding-bearing document is still slower than a benign one. No formal statistical equivalence test was run, so equivalence is **not claimed**.
 
 Differential against published v1.1.8 over 20 control and benign cells: 0 parity mismatches. This is **bounded parity, not universal semantic equivalence**: a shared failure would not be caught by a parity check alone, so the security controls are additionally asserted independently of the baseline.
 
-Independent exact-SHA review of the release tree is pending; publication is not authorized by this package.
+Independent exact-SHA review of the release tree: **PASS** for commit `08f27a415ceb39bc40728706e9b7db599c210d53` and tree `ecac5f7b3f01e7a5d8a56e157904b2f8d60104d4`. Publication is not authorized by this package.
 
 AgentDojo-style adapter study (historical, 1.1.6-era, not a 1.1.8 or 1.1.9 enforcement claim): 160 matched banking attack pairs on one free model; attacker success 6/160 with the adapter off versus 0/160 with a tool-result-quarantine adapter on; legitimate-task utility 89/160 versus 87/160. Only 5 of 16 banking tasks were sampled, the on-arm did not exercise the Core action gate, 40 pairs were lost to a harness error, and run-to-run variance was not measured. These numbers are context only, not a general protection rate.
 
