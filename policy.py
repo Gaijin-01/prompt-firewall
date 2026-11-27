@@ -1631,43 +1631,32 @@ def _is_comment_start(text: str, idx: int) -> bool:
     return prev.isspace() or prev in ";|&()<>$\\"
 
 
-#: Bounded memo of shell tokenizations.
-#:
-#: ``_shell_tokenize`` is a *pure* function of its input string: it reads no
-#: mutable module state, consults no clock and no environment.  The B1
-#: action path tokenizes the same command more than once per tool call
-#: (the write-destination extractor, the ambiguous-write detector and the
-#: unresolved-destination extractor each tokenize it independently), and the
-#: same commands recur across calls.  Memoizing the token list therefore
-#: removes *redundant work*, not *work*: every caller still receives the
-#: exact token list the uncached implementation would have produced.
-#:
-#: The cache is bounded so a long-lived process cannot grow it without
-#: limit, and it is keyed on the exact command string, so two different
-#: commands never share an entry.
-_SHELL_TOKENIZE_MEMO: Dict[str, List[str]] = {}
-
 #: Maximum number of memoized tokenizations kept at once.
 _SHELL_TOKENIZE_MEMO_MAX = 512
+
+# The tokenization memo is evaluation-local.  Although tokenization itself is
+# environment-independent, command strings can contain sensitive arguments and
+# a process-global mutable dict would retain them and race during eviction.
 
 
 def _shell_tokenize(command: str) -> List[str]:
     """Split a command into tokens, keeping operators (including newlines).
 
-    Memoized: see ``_SHELL_TOKENIZE_MEMO``.  The returned list is shared
+    Memoized within the current evaluation only.  The returned list is shared
     between callers, so a caller MUST NOT mutate it.  Every caller in this
     module only reads it.
     """
     if not command:
         return []
-    cached = _SHELL_TOKENIZE_MEMO.get(command)
+    memo = eval_state().setdefault("shell_tokenize", {})
+    cached = memo.get(command)
     if cached is not None:
         return cached
     tokens = _shell_tokenize_uncached(command)
-    if len(_SHELL_TOKENIZE_MEMO) >= _SHELL_TOKENIZE_MEMO_MAX:
-        # Bounded: drop the oldest inserted entry.
-        del _SHELL_TOKENIZE_MEMO[next(iter(_SHELL_TOKENIZE_MEMO))]
-    _SHELL_TOKENIZE_MEMO[command] = tokens
+    if len(memo) >= _SHELL_TOKENIZE_MEMO_MAX:
+        # Bounded per-evaluation memo; no cross-thread eviction race.
+        del memo[next(iter(memo))]
+    memo[command] = tokens
     return tokens
 
 

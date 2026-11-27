@@ -145,8 +145,9 @@ def test_exception_cleanup_restores_previous_cache_state(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("module, names", [
-    (policy, ["_SHELL_WRITE_MEMO", "_NORMALIZE_PATH_MEMO",
-              "_ARG_STRINGS_MEMO", "_ACTIVE_HERMES_HOME_MEMO"]),
+    (policy, ["_SHELL_WRITE_MEMO", "_SHELL_TOKENIZE_MEMO",
+              "_NORMALIZE_PATH_MEMO", "_ARG_STRINGS_MEMO",
+              "_ACTIVE_HERMES_HOME_MEMO"]),
     (load_module("executable_view"), ["_EXECUTABLE_VIEW_MEMO"]),
 ])
 def test_no_process_global_memo_attributes(module, names) -> None:
