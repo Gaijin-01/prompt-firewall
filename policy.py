@@ -1407,14 +1407,49 @@ def _bounded_arg_strings(
 
 def _arg_text(args: Any) -> str:
     """Concatenate nested string values of a tool argument mapping."""
-    text, _complete = _bounded_arg_strings(args)
+    text, _complete = _arg_strings_once(args)
     return text
 
 
 def _arg_scan_complete(args: Any) -> bool:
     """False when the argument payload exceeded the inspection budget."""
-    _text, complete = _bounded_arg_strings(args)
+    _text, complete = _arg_strings_once(args)
     return complete
+
+
+#: Per-evaluation memo of the bounded argument strings.
+#:
+#: ``_bounded_arg_strings`` walks the whole argument tree and concatenates
+#: every nested string value under an explicit character budget.  The B1
+#: action path needs BOTH of its results -- the joined text (to scan) and
+#: the completeness bit (to decide whether the scan was exhaustive) -- but
+#: it asked for them separately, so the tree was walked twice per tool
+#: call.
+#:
+#: The walk depends only on the argument mapping, which cannot change
+#: while the call is being judged, so the result is computed once per
+#: evaluation.  The memo is keyed on the *identity* of the argument
+#: mapping, so two different mappings never share an entry.  Outside an
+#: evaluation the memo is absent and the walk happens on every call,
+#: exactly as before.
+_ARG_STRINGS_MEMO: Optional[Tuple[Any, str, bool]] = None
+
+
+def _arg_strings_once(args: Any) -> Tuple[str, bool]:
+    """The bounded argument text and its completeness bit, computed once.
+
+    Inside a policy evaluation the result is memoized, so the argument
+    tree is walked once instead of once per consumer.
+    """
+    global _ARG_STRINGS_MEMO
+    memo = _ARG_STRINGS_MEMO
+    if memo is not None:
+        cached_args, text, complete = memo
+        if cached_args is args:
+            return text, complete
+    result = _bounded_arg_strings(args)
+    _ARG_STRINGS_MEMO = (args, result[0], result[1])
+    return result
 
 
 def _dedupe(values: Iterable[str]) -> List[str]:
@@ -3695,14 +3730,17 @@ def evaluate_tool_call(
     is removed again before this function returns, so a later evaluation
     always re-reads the filesystem.
     """
-    global _NORMALIZE_PATH_MEMO
+    global _NORMALIZE_PATH_MEMO, _ARG_STRINGS_MEMO
     previous = _NORMALIZE_PATH_MEMO
+    previous_args = _ARG_STRINGS_MEMO
     _NORMALIZE_PATH_MEMO = {}
+    _ARG_STRINGS_MEMO = None
     try:
         return _evaluate_tool_call(
             tool_name, args, grant=grant, cwd=cwd)
     finally:
         _NORMALIZE_PATH_MEMO = previous
+        _ARG_STRINGS_MEMO = previous_args
 
 
 def _evaluate_tool_call(
