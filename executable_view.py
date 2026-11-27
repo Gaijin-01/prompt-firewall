@@ -9,6 +9,7 @@ import io
 import re
 import shlex
 import tokenize
+from typing import Dict, Tuple
 
 
 def _python_executable_view(source: str) -> str:
@@ -88,9 +89,44 @@ def _shell_executable_view(source: str) -> str:
     return "\n".join(out)
 
 
+#: Bounded memo of executable-command views.
+#:
+#: ``executable_command_view`` is a *pure* function of ``(source,
+#: tool_name)``: it reads no mutable module state, no clock and no
+#: environment.  The B1 action path builds a view of the same command more
+#: than once per tool call (the provider-environment-assignment check and
+#: the CLI endpoint check each build one), and the same command recurs
+#: across calls.  Memoizing the view therefore removes redundant work, not
+#: work: every caller still receives the exact string the uncached
+#: implementation would have produced.
+#:
+#: The cache is bounded so a long-lived process cannot grow it without
+#: limit, and it is keyed on the exact ``(source, tool_name)`` pair, so
+#: two different inputs never share an entry.
+_EXECUTABLE_VIEW_MEMO: Dict[Tuple[str, str], str] = {}
+
+#: Maximum number of memoized views kept at once.
+_EXECUTABLE_VIEW_MEMO_MAX = 512
+
+
 def executable_command_view(source: str, tool_name: str) -> str:
+    """The executable projection of *source* for *tool_name*.
+
+    Memoized: see ``_EXECUTABLE_VIEW_MEMO``.  The returned string is
+    immutable, so sharing it between callers is safe.
+    """
     if not source:
         return source
+    key = (source, tool_name)
+    cached = _EXECUTABLE_VIEW_MEMO.get(key)
+    if cached is not None:
+        return cached
     if tool_name in ("execute_code", "python"):
-        return _python_executable_view(source)
-    return _shell_executable_view(source)
+        view = _python_executable_view(source)
+    else:
+        view = _shell_executable_view(source)
+    if len(_EXECUTABLE_VIEW_MEMO) >= _EXECUTABLE_VIEW_MEMO_MAX:
+        # Bounded: drop the oldest inserted entry.
+        del _EXECUTABLE_VIEW_MEMO[next(iter(_EXECUTABLE_VIEW_MEMO))]
+    _EXECUTABLE_VIEW_MEMO[key] = view
+    return view
