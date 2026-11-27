@@ -4,43 +4,51 @@
 
 Plugin-only **performance** update of the deterministic firewall. Baseline: published v1.1.8. No Core, OS-trust, catalog or Marketplace changes are part of this release, and nothing has been pushed, published or deployed.
 
-This release changes **only the scanner**. The action policy (`policy.py`), the grant model (`grants.py`), the hook modules and every other runtime module are byte-identical to published v1.1.8.
+This release changes the scanner **and** the action path. The scanner work is the frozen Track B variant E checkpoint; the action-path work removes redundant work from the `pre_tool_call` policy evaluation. Every security-relevant behaviour is unchanged: the findings, their coordinates, the quarantine spans, the withheld content and the reason codes are identical to the previous candidate, and **no new ALLOW** is introduced.
 
 ### Fixed
 - **Unicode `IGNORECASE` fallback for the Cyrillic gates.** The `mixed_language_override` and `ignore_previous_instructions_ru` rules use `re.IGNORECASE`, but the case-folding projection used by the fast path folds ASCII only. A non-ASCII document is now admitted to those two rules conservatively, so an upper-cased Cyrillic phrase is still detected.
-- **Missing role alternative.** The `role_spoof_system_turn` rule now accepts the `endoftext` role marker.
+- **Missing role alternative.** The `role_spoof_system_turn` rule now accepts the `endtext` role marker.
 - **Hex decoder prefix.** The hex decoder strips an optional `0x` prefix before decoding.
 - **Private `re._parser` dependency.** The candidate used the private CPython module `re._parser` to derive literal gates. That module is an implementation detail and may be absent or reshaped. Its use is now guarded: when it is unavailable the affected gates are **disabled** and the **original regex scan runs instead** — no rule is silently skipped. The parser-independent fallback derives exactly the same invisible-character set, so findings and their offsets are unchanged. `tests/test_prefilter_fallback.py` proves the fallback by re-importing the package with `re._parser` hidden and comparing the finding sets.
 
 ### Added
 - `_prefilter.py`: conservative literal-gate derivation. A gate is only installed when a *mandatory* literal has been proven, so a gated rule can never be silently dropped.
-- Permanent release tests: `tests/test_invisible_contract.py`, `tests/test_gate_contract.py`, `tests/test_security_controls.py`, `tests/test_prefilter_fallback.py`.
+- Permanent release tests: `tests/test_invisible_contract.py`, `tests/test_gate_contract.py`, `tests/test_security_controls.py`, `tests/test_prefilter_fallback.py`, `tests/test_surrogate_scan.py`.
 - Lazy invisible-character normalisation: a document with no invisible character is returned unchanged, with no index map materialised.
 - Byte-level candidate scan for long base64 and hex runs, replacing two regex scans.
+- `tests/test_surrogate_scan.py` proves the path normalizer's surrogate rejection is **exactly** equivalent to the original per-character test: exhaustively over all 1,114,112 Unicode code points and over 20,000 seeded random multi-character strings, with zero mismatches.
 
 ### Changed
-- `detectors.py` only. `policy.py`, `grants.py`, `strings.py`, `explain.py`, `executable_view.py`, `action_context.py`, `pf_locale.py` and `__init__.py` are unchanged apart from the version constant.
+- **The action path no longer repeats work it has already done.** The `pre_tool_call` policy evaluation was resolving the same shell command, the same executable view, the same write-destination analysis and the same path several times over. These are now computed once:
+  - `policy.py` — `_shell_tokenize`, `_shell_write_destinations` and `executable_command_view` are memoized on their exact inputs; `normalize_path`, the bounded argument walk and the active Hermes home are resolved once per policy evaluation; the surrogate scan no longer loops over every character of every path.
+  - `executable_view.py` — `executable_command_view` is memoized on the exact `(source, tool_name)` pair.
+  - Every memo is scoped to a single evaluation (or a bounded cache keyed on the exact input), so a later evaluation always re-reads the filesystem and can never act on a stale resolution.
+- `detectors.py` and `_prefilter.py` — the **frozen scanner**, byte-identical to the frozen Track B variant E checkpoint `fdd518226633eadcd0be3a1369b2e89e9efde562`.
+- `grants.py`, `strings.py`, `explain.py`, `action_context.py` and `pf_locale.py` are unchanged.
 - `tests/test_native_integration.py` now imports `pf_loader` itself, so the module is runnable on its own. Previously it only worked when a sibling test module had imported `pf_loader` first.
 
 ### Excluded
 - The frozen PF119 symbolic research is **not** part of this release: it is absent from the shipped tree, is not imported by any runtime module, and no part of it is claimed as a shipped feature.
 - OS-backed monotonic trust, same-UID isolation, rollback guarantees and native Core enforcement are not claimed or implemented by this release.
-- No new ALLOW is introduced by the scanner change: the action policy is untouched.
+- **No new ALLOW is introduced.** The action-path work removes redundant computation only; the findings, coordinates, quarantine spans, withheld content and reason codes are unchanged, and the candidate ALLOWs nothing that 1.1.7 does not ALLOW.
 
 ### Fixed (release-lane follow-up, not part of the frozen scanner checkpoint)
 - **Throughput accounting in the release benchmark runner.** The runner divided the one-pass corpus size by the summed wall time of *all* repetitions, under-reporting throughput by a factor of `reps` (300x for the release runs). The numerator is now `chars x reps`, and the pooled path uses `sum(cell_chars x cell_reps)`. The full benchmark was re-run from scratch and every derived artefact regenerated. The formula is pinned by `bench/test_throughput_accounting.py`. The frozen scanner checkpoint is unaffected: no runtime module changed.
 
 ### Verification
-- Full public retained suite under a compatible Hermes Core: **319 passed** (298 published + 21 new).
+- Full public retained suite under a compatible Hermes Core: **330 passed** (298 published + 21 new + 11 surrogate-equivalence).
 - Public retained suite without Hermes Core (`hermes_cli` not importable): **305 passed**; 14 Core-dependent cases cannot run (13 error at setup, 1 fails).
 - Native integration through Hermes Core's own plugin discovery and hook dispatcher (`invoke_hook`): **13 passed**, Core `0bf92a126102d274ff2d6a839cf8b83ab75ac3d0`.
 - Differential against published v1.1.8 over 20 control and benign cells: **0 parity mismatches**; 13 required security detections all fire and 5 benign controls stay clean.
 - Full B2 benchmark on the original archived corpus: 11 result cells and 10 B1 action cells, 300 measured samples each, fixed CPU affinity, one child process per variant, raw samples archived. See the release dossier for the measured p50/p95/p99/max and the actual chars/s.
 
-### Known regression against the released 1.1.7 baseline (measured, not hidden)
-- **The B1 `pre_tool_call` path is slower than 1.1.7.** Measured on the same run, the pooled B1 mean latency is ~15% higher than 1.1.7's and the pooled B1 p95 measures 1.0745x 1.1.7's. The B4 relative-regression gate therefore reads **FAIL**.
-- This regression is **inherited from 1.1.8, not introduced by 1.1.9**: published 1.1.8 already measures 1.188x 1.1.7's B1 mean, the candidate's `policy.py` is byte-identical to published 1.1.8, and the candidate is not slower than published 1.1.8 on the same measurement. 1.1.8's `policy.py` differs from 1.1.7's and 1.1.8 added `executable_view.py`, `action_context.py` and `pf_locale.py` to the action path.
-- The B4 **verdict is not stable**: over 12 independent repeats of the identical measurement, 8 passed and 4 failed, because the B1 p95 statistic sits at the sub-millisecond noise floor. The mean-latency regression is real; only the p95 boundary is unstable. Evidence: `bench/check_b4_stability.py`, `bench/check_b1_attribution.py`.
+### The B1 regression against the released 1.1.7 baseline is CLOSED
+- **Earlier candidates of this release inherited a B1 `pre_tool_call` regression from 1.1.8.** Published 1.1.8 already measured slower than 1.1.7 on the B1 mean, and 1.1.8's `policy.py` differs from 1.1.7's. The candidate inherited 1.1.8's action path byte-for-byte, so it inherited the regression; the B4 gate read **FAIL** and the verdict *flipped* between identical repeats (15/24 PASS, median ratio 0.9798), because the B1 p95 statistic sits at the sub-millisecond noise floor.
+- **This release removes the inherited overhead.** The candidate's action path is now deliberately optimized, and the frozen scanner (`detectors.py`, `_prefilter.py`) is still byte-identical to the frozen checkpoint.
+- **Measured on the final locked run** (same host, same corpus, same method, inside one benchmark run): candidate pooled B1 p95 **0.3577 ms** against 1.1.7's **0.5478 ms** — ratio **0.653**; pooled B1 mean **0.1942 ms** against **0.3215 ms**. The B4 gate reads **PASS**, decisively: the margin is far larger than the measurement noise floor.
+- **Paired alternating AB/BA measurement** (`bench/check_b1_ab_ba.py`, 16 rounds, 300 reps x 10 B1 cells, one measurement of each variant per round in strictly alternating order): **16/16 rounds PASS**, median paired p95 ratio **0.5942**, and the run-order artefact — `|median(AB) - median(BA)|` — is **0.0045**, so the verdict is not an artefact of the measuring order.
+- Evidence: `bench/check_b1_ab_ba.py`, `bench/check_b4_stability.py`, `bench/check_b1_attribution.py`, `bench/evidence/b1_ab_ba.json`.
 
 ### Limitations
 - Parity is bounded by the corpus. It is **not** a proof of all-input equivalence.
