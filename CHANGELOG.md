@@ -37,6 +37,11 @@ This release changes **only the scanner**. The action policy (`policy.py`), the 
 - Differential against published v1.1.8 over 20 control and benign cells: **0 parity mismatches**; 13 required security detections all fire and 5 benign controls stay clean.
 - Full B2 benchmark on the original archived corpus: 11 result cells and 10 B1 action cells, 300 measured samples each, fixed CPU affinity, one child process per variant, raw samples archived. See the release dossier for the measured p50/p95/p99/max and the actual chars/s.
 
+### Known regression against the released 1.1.7 baseline (measured, not hidden)
+- **The B1 `pre_tool_call` path is slower than 1.1.7.** Measured on the same run, the pooled B1 mean latency is ~15% higher than 1.1.7's and the pooled B1 p95 measures 1.0745x 1.1.7's. The B4 relative-regression gate therefore reads **FAIL**.
+- This regression is **inherited from 1.1.8, not introduced by 1.1.9**: published 1.1.8 already measures 1.188x 1.1.7's B1 mean, the candidate's `policy.py` is byte-identical to published 1.1.8, and the candidate is not slower than published 1.1.8 on the same measurement. 1.1.8's `policy.py` differs from 1.1.7's and 1.1.8 added `executable_view.py`, `action_context.py` and `pf_locale.py` to the action path.
+- The B4 **verdict is not stable**: over 12 independent repeats of the identical measurement, 8 passed and 4 failed, because the B1 p95 statistic sits at the sub-millisecond noise floor. The mean-latency regression is real; only the p95 boundary is unstable. Evidence: `bench/check_b4_stability.py`, `bench/check_b1_attribution.py`.
+
 ### Limitations
 - Parity is bounded by the corpus. It is **not** a proof of all-input equivalence.
 - The 20 ms p95 budget is a property of the scanned corpus, not a universal latency bound: large finding-bearing documents remain slower than benign ones.
