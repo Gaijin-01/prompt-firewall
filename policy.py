@@ -697,17 +697,41 @@ def dispatch_decision(*, veto_reason=None, veto_detail=None, unresolved_reason=N
     return None
 
 
+#: Per-evaluation memo of the active Hermes home.
+#:
+#: ``_active_hermes_home`` resolves the Hermes home the running agent
+#: actually uses.  It performs a module import (``from hermes_cli.config
+#: import get_hermes_home``) and a call into Hermes Core on EVERY
+#: invocation, and the B1 action path invokes it five times per tool call
+#: (the protected-alias roots, the transient-dir exclusion, the protected
+#: roots, and two control-plane checks).
+#:
+#: The resolved home cannot change while a single tool call is being
+#: judged, so it is resolved once per evaluation.  The memo lives for
+#: exactly ONE policy evaluation; outside one the home is resolved on
+#: every call, exactly as before.
+_ACTIVE_HERMES_HOME_MEMO: Optional[str] = None
+
+
 def _active_hermes_home() -> str:
     """The Hermes home the running agent actually uses (never raises)."""
+    global _ACTIVE_HERMES_HOME_MEMO
+    memo = _ACTIVE_HERMES_HOME_MEMO
+    if memo is not None:
+        return memo
+    home_path = ""
     try:
         from hermes_cli.config import get_hermes_home
 
         home = get_hermes_home()
         if home:
-            return str(home).rstrip("/") or "/"
+            home_path = str(home).rstrip("/") or "/"
     except Exception:
         pass
-    return os.path.join(_home(), ".hermes")
+    if not home_path:
+        home_path = os.path.join(_home(), ".hermes")
+    _ACTIVE_HERMES_HOME_MEMO = home_path
+    return home_path
 
 
 def _within(child: str, parent: str) -> bool:
@@ -3730,17 +3754,20 @@ def evaluate_tool_call(
     is removed again before this function returns, so a later evaluation
     always re-reads the filesystem.
     """
-    global _NORMALIZE_PATH_MEMO, _ARG_STRINGS_MEMO
+    global _NORMALIZE_PATH_MEMO, _ARG_STRINGS_MEMO, _ACTIVE_HERMES_HOME_MEMO
     previous = _NORMALIZE_PATH_MEMO
     previous_args = _ARG_STRINGS_MEMO
+    previous_home = _ACTIVE_HERMES_HOME_MEMO
     _NORMALIZE_PATH_MEMO = {}
     _ARG_STRINGS_MEMO = None
+    _ACTIVE_HERMES_HOME_MEMO = None
     try:
         return _evaluate_tool_call(
             tool_name, args, grant=grant, cwd=cwd)
     finally:
         _NORMALIZE_PATH_MEMO = previous
         _ARG_STRINGS_MEMO = previous_args
+        _ACTIVE_HERMES_HOME_MEMO = previous_home
 
 
 def _evaluate_tool_call(
