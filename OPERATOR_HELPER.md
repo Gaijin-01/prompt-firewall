@@ -48,17 +48,28 @@ git rev-parse refs/tags/v1.1.9^{commit}
 # Compare this output byte-for-byte with the commit in the published release metadata.
 ```
 
-For a local checkout, verify the release tag before installing:
+For a local checkout, fetch and detach the tag, then verify it against the
+published GitHub Release metadata *before* installing or enabling the plugin:
 
 ```bash
 git clone https://github.com/Gaijin-01/prompt-firewall.git /tmp/prompt-firewall-pinned
 git -C /tmp/prompt-firewall-pinned fetch --tags origin
-git -C /tmp/prompt-firewall-pinned rev-parse refs/tags/v1.1.9^{commit}
+EXPECTED_COMMIT=$(curl -fsSL \
+  https://api.github.com/repos/Gaijin-01/prompt-firewall/releases/tags/v1.1.9 | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["target_commitish"])')
+TAG_COMMIT=$(git -C /tmp/prompt-firewall-pinned rev-parse refs/tags/v1.1.9^{commit})
+test "$EXPECTED_COMMIT" = "$TAG_COMMIT"
+git -C /tmp/prompt-firewall-pinned checkout --detach "$TAG_COMMIT"
+test "$(git -C /tmp/prompt-firewall-pinned rev-parse HEAD)" = "$EXPECTED_COMMIT"
 hermes plugins install /tmp/prompt-firewall-pinned --no-enable
+hermes plugins doctor prompt-firewall --ci
+hermes plugins enable prompt-firewall
 ```
 
-Before publication, `v1.1.9` is intentionally not assumed to exist; use the
-reviewed local package and its recorded commit only for pre-publication checks.
+The `test` checks intentionally fail closed if the tag and published release
+metadata disagree. Before publication, `v1.1.9` is intentionally not assumed
+to exist; use the reviewed local package and its recorded commit only for
+pre-publication checks.
 
 ```bash
 hermes plugins show prompt-firewall
