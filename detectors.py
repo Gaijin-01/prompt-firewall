@@ -1563,6 +1563,18 @@ def _mixed_descriptive_frame(text: str, start: int, end: int, index: _FrameIndex
 _GATES: dict = {}
 
 
+#: The prefilter module, bound once at import time.
+#:
+#: Binding it here rather than importing it lazily inside each call keeps the
+#: gate path independent of ``sys.modules`` state at call time.  If the module
+#: cannot be imported at all, ``_PREFILTER`` is ``None`` and the scanner
+#: falls back to the original regex scan for every rule.
+try:
+    from . import _prefilter as _PREFILTER
+except Exception:  # pragma: no cover - _prefilter is part of the tree
+    _PREFILTER = None
+
+
 def _build_gates() -> dict:
     """Derive conservative literal gates for the rule table.
 
@@ -1572,10 +1584,9 @@ def _build_gates() -> dict:
     when a *mandatory* literal has been proven, so a gated rule can never be
     silently dropped: the gate is a necessary condition for a match.
     """
-    try:
-        from ._prefilter import derive_rule_literals
-    except Exception:
+    if _PREFILTER is None:
         return {}
+    derive_rule_literals = _PREFILTER.derive_rule_literals
 
     gates = {}
     for pattern_id, _category, regex, _severity in _RULES:
@@ -1611,9 +1622,11 @@ def _gate_allows(pattern_id: str, text: str, norm_cache: list) -> bool:
     if kind == "cs":
         return any(lit in text for lit in lits)
     if norm_cache[0] is None:
-        from ._prefilter import normalize_ci
-
-        norm_cache[0] = normalize_ci(text)
+        if _PREFILTER is None:
+            # No prefilter module: fall back to the original regex scan
+            # rather than skipping the rule.
+            return True
+        norm_cache[0] = _PREFILTER.normalize_ci(text)
     norm = norm_cache[0]
     return any(lit in norm for lit in lits)
 
