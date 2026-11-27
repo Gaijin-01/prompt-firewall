@@ -2,7 +2,19 @@
 
 A deterministic prompt-injection firewall for [Hermes Agent](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins).
 
-Version **1.1.8** is a plugin-only release candidate. It is not published to the catalog yet; the catalog currently points at v1.1.6. Production installations remain on the previously published version until a maintainer-reviewed catalog pull request moves the published pin.
+Version **1.1.9** is a plugin-only **performance** release candidate. It is not published to the catalog yet; the catalog currently points at an earlier release. Production installations remain on the previously published version until a maintainer-reviewed catalog pull request moves the published pin. Nothing in this tree has been pushed, published or deployed.
+
+## What changed in 1.1.9
+
+This release changes **the scanner only**. `policy.py`, `grants.py`, `strings.py`, `explain.py`, `executable_view.py`, `action_context.py` and `pf_locale.py` are byte-identical to published v1.1.8, so the action boundary, the grant model and every hook signature are unchanged.
+
+- **Performance.** A conservative literal-gate prefilter skips a rule when the document provably cannot contain any of that rule's mandatory literals, and invisible-character normalisation takes an identity fast path on documents with no invisible character. On the original archived B2 corpus this brings the pooled p95 of `transform_tool_result` from roughly 309 ms down to the mid-teens of milliseconds.
+- **Three security fixes carried in from the frozen Track B checkpoint.** The Unicode `IGNORECASE` fallback for the two Cyrillic gates, the missing `endoftext` role alternative, and the optional `0x` prefix in the hex decoder.
+- **A guarded dependency on a private CPython module.** The gate derivation uses `re._parser`, which is a CPython implementation detail. It is now optional: on an interpreter where it is unavailable or reshaped, the affected gates are disabled and the original regex scan runs instead. No rule is silently skipped, and the parser-independent fallback derives exactly the same invisible-character set. `tests/test_prefilter_fallback.py` proves this by re-importing the package with `re._parser` hidden and comparing the finding sets.
+- **Permanent release tests.** `tests/test_invisible_contract.py`, `tests/test_gate_contract.py`, `tests/test_security_controls.py` and `tests/test_prefilter_fallback.py` are added to the tree. They are self-contained: no external corpus, no absolute path, no live Hermes.
+- **One test-portability fix.** `tests/test_native_integration.py` now imports `pf_loader` itself, so the module can be run on its own. Previously it only worked when a sibling test module had already imported `pf_loader`.
+
+The 1.1.8 baseline is preserved as published history. Version 1.1.9 does not rewrite or replace that history. The frozen PF119 symbolic research and the experimental Durable Ledger developed alongside this line are **not part of this plugin**: both are absent from the shipped tree and are not imported by any runtime module. No OS-backed monotonic trust, same-UID isolation, D12 rollback guarantee or native Core enforcement is claimed by this release.
 
 ## What changed in 1.1.8
 
@@ -134,35 +146,39 @@ Only metadata is recorded - reason code, source label, pattern ids. File content
 
 ## Evidence and verification status
 
-The public tree contains **22 files**: 15 runtime/document files plus **7 retained test files**. Git reports **23 tree entries** because `tests/` is itself counted as one tree entry. Audit logs, benchmark corpora, vendored Core test dependencies and research artifacts are not in the public tree; they live in a separate private audit package.
+The public tree contains **27 files**: 16 runtime/document files plus **11 retained test files**. Git reports **28 tree entries** because `tests/` is itself counted as one tree entry. Audit logs, benchmark corpora, vendored Core test dependencies and research artifacts are not in the public tree; they live in a separate private audit package.
 
 Verification has three distinct scopes. Do not conflate them:
 
 | Scope | Prerequisites | Result |
 |---|---|---|
-| Complete pre-extraction candidate suite | Full source checkout with vendored Hermes Core test dependencies | 557 passed |
-| Public retained suite, with Hermes Core | Public tree plus a Hermes Core checkout providing `hermes_cli` | **298 passed** |
-| Public retained suite, without Hermes Core | Public tree only | **284 passed**; 14 Core-dependent cases cannot run |
+| Complete pre-extraction candidate suite | Full source checkout with vendored Hermes Core test dependencies | 557 passed (historical, 1.1.8-era) |
+| Public retained suite, with Hermes Core | Public tree plus a Hermes Core checkout providing `hermes_cli` | **319 passed** for 1.1.9 (298 in 1.1.8 + 21 new) |
+| Public retained suite, without Hermes Core | Public tree only, `hermes_cli` not importable | **305 passed**; 14 Core-dependent cases cannot run (13 error at setup, 1 fails) |
 
 Reproduce the public results:
 
 ```bash
 # with Hermes Core available on PYTHONPATH
-python3 -m pytest -q tests --import-mode=importlib -p no:cacheprovider
+cd tests && python3 -m pytest -q . -p no:cacheprovider
 
-# without Hermes Core (14 native cases error/fail at setup: hermes_cli is absent)
-python3 -m pytest -q tests --import-mode=importlib -p no:cacheprovider
+# without Hermes Core (14 Core-dependent cases cannot run: hermes_cli is absent)
+cd tests && python3 -m pytest -q . -p no:cacheprovider
 ```
+
+Run the suite from inside `tests/`. The plugin root's `__init__.py` is a package marker, not a test module; running pytest with the plugin directory as the collection root makes pytest try to import it as a test module and fail with `ImportError: attempted relative import with no known parent package`.
 
 The 557-pass result belongs to the **complete pre-extraction candidate suite**, not to this minimal public tree. It is preserved as historical verification evidence, not claimed as a current result of the public tree.
 
-Native three-hook compatibility: 14 passed when Hermes Core is available. Focused security regressions (P0-A, P0-B, P0-2, scoped grants): all passed in the retained suite; raw logs are in the private audit package.
+Native three-hook compatibility: 13 passed when Hermes Core is available (Core `0bf92a126102d274ff2d6a839cf8b83ab75ac3d0`), exercised through Hermes' own plugin discovery and hook dispatcher.
 
-Performance: no material relative p95/p99 regression versus v1.1.7 (candidate p95 +0.33%, p99 -0.56% on the shared harness). No formal statistical equivalence test was run; equivalence is therefore **not claimed**. One pre-registered absolute budget (p95 of `transform_tool_result` <= 20 ms on a corpus containing two 200,000-character outputs) is **FAIL at 309 ms** for the candidate *and for both earlier versions* (v1.1.7: 308 ms, v1.1.6: 512 ms). This is a property of the scan budget, not a regression introduced in 1.1.8.
+Performance: the 1.1.9 scanner brings the pooled p95 of `transform_tool_result` on the original archived B2 corpus (11 result cells, 300 measured samples each, fixed CPU affinity, one child process per variant) to the mid-teens of milliseconds, against roughly 309 ms for published v1.1.8. The pre-registered absolute budget (p95 <= 20 ms on that corpus) is therefore **met** for 1.1.9, where it was **FAIL at 309 ms** for 1.1.8. The measured numbers, the raw samples and the actual chars/s are in the release dossier. This is a property of the scanned corpus, **not** a universal latency bound: a large finding-bearing document is still slower than a benign one. No formal statistical equivalence test was run, so equivalence is **not claimed**.
+
+Differential against published v1.1.8 over 20 control and benign cells: 0 parity mismatches. This is **bounded parity, not universal semantic equivalence**: a shared failure would not be caught by a parity check alone, so the security controls are additionally asserted independently of the baseline.
 
 Independent exact-SHA review of the release tree is pending; publication is not authorized by this package.
 
-AgentDojo-style adapter study (historical, 1.1.6-era, not a 1.1.8 enforcement claim): 160 matched banking attack pairs on one free model; attacker success 6/160 with the adapter off versus 0/160 with a tool-result-quarantine adapter on; legitimate-task utility 89/160 versus 87/160. Only 5 of 16 banking tasks were sampled, the on-arm did not exercise the Core action gate, 40 pairs were lost to a harness error, and run-to-run variance was not measured. These numbers are context only, not a general protection rate.
+AgentDojo-style adapter study (historical, 1.1.6-era, not a 1.1.8 or 1.1.9 enforcement claim): 160 matched banking attack pairs on one free model; attacker success 6/160 with the adapter off versus 0/160 with a tool-result-quarantine adapter on; legitimate-task utility 89/160 versus 87/160. Only 5 of 16 banking tasks were sampled, the on-arm did not exercise the Core action gate, 40 pairs were lost to a harness error, and run-to-run variance was not measured. These numbers are context only, not a general protection rate.
 
 ## Independence and community status
 
@@ -189,7 +205,7 @@ No release of this plugin provides complete protection. The following gaps are p
 
 ## Scope of the published tree
 
-The published tree contains 22 files (23 Git tree entries, counting the `tests/` directory): `plugin.yaml`, `__init__.py`, `action_context.py`, `detectors.py`, `executable_view.py`, `explain.py`, `grants.py`, `pf_locale.py`, `policy.py`, `strings.py`, `README.md`, `CHANGELOG.md`, `SECURITY_LIMITATIONS.md`, `LICENSE`, `.gitignore` and 7 retained regression files under `tests/`. Audit, benchmark and development-only files are not part of it; they live in a separate private audit package.
+The published tree contains 27 files (28 Git tree entries, counting the `tests/` directory): `plugin.yaml`, `__init__.py`, `_prefilter.py`, `action_context.py`, `detectors.py`, `executable_view.py`, `explain.py`, `grants.py`, `pf_locale.py`, `policy.py`, `strings.py`, `README.md`, `CHANGELOG.md`, `SECURITY_LIMITATIONS.md`, `LICENSE`, `.gitignore` and 11 retained regression files under `tests/`. Audit, benchmark and development-only files are not part of it; they live in a separate private audit package.
 
 ## Bounded shell semantics
 

@@ -100,7 +100,62 @@ _INVISIBLE_RE = re.compile(
 
 # Long base64 / hex / percent-encoded runs that could carry an encoded payload.
 _B64_RE = re.compile(r"[A-Za-z0-9+/]{60,}={0,2}")
+
+# Byte-equivalent C-level candidate scan for _B64_RE (see _hex_candidates).
+_B64_ALPHABET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+_B64_MASK = str.maketrans(
+    {**{i: "\x00" for i in range(128)}, **{ord(c): "\x01" for c in _B64_ALPHABET}}
+)
+_B64_RUN = "\x01" * 60
+
+
+def _b64_candidates(text: str):
+    masked = text.translate(_B64_MASK)
+    pos = 0
+    n = len(masked)
+    while True:
+        start = masked.find(_B64_RUN, pos)
+        if start < 0:
+            return
+        end = start
+        while end < n and masked[end] == "\x01":
+            end += 1
+        eq = 0
+        while end < n and text[end] == "=" and eq < 2:
+            end += 1
+            eq += 1
+        yield (start, end, text[start:end])
+        pos = end
 _HEX_RE = re.compile(r"(?:0x)?[0-9a-fA-F]{80,}")
+
+# Byte-equivalent C-level candidate scan for _HEX_RE.  A translate mask turns
+# every hex character into one marker; non-hex ASCII becomes NUL.  Offsets are
+# preserved because translate is length-preserving.  The optional 0x prefix is
+# reattached only when it lies after the previous match end, matching re's
+# non-overlapping finditer semantics.
+_HEX_MARK = "\x01"
+_HEX_MASK = str.maketrans(
+    {**{i: "\x00" for i in range(128)}, **{ord(c): _HEX_MARK for c in "0123456789abcdefABCDEF"}}
+)
+_HEX_RUN = _HEX_MARK * 80
+
+
+def _hex_candidates(text: str):
+    masked = text.translate(_HEX_MASK)
+    pos = 0
+    n = len(masked)
+    while True:
+        start = masked.find(_HEX_RUN, pos)
+        if start < 0:
+            return
+        end = start
+        while end < n and masked[end] == _HEX_MARK:
+            end += 1
+        blob_start = start
+        if start >= 2 and start - 2 >= pos and text[start - 2:start] == "0x":
+            blob_start = start - 2
+        yield (blob_start, end, text[blob_start:end])
+        pos = end
 
 #: A single percent-escape triplet. Percent-encoded payloads are usually
 #: *sparse*: ``urllib.parse.quote`` leaves alphanumerics unescaped, so the
@@ -169,21 +224,122 @@ def _excerpt(text: str, start: int, end: int, limit: int = 120) -> str:
     return snippet
 
 
-def _strip_invisible_map(text: str) -> Tuple[str, List[int]]:
-    """Drop invisible/zero-width characters, keeping an index map back.
+def _invisible_codepoints():
+    """The exact set of code points matched by ``_INVISIBLE_RE``.
 
-    Detection runs on this cleaned copy so that ``ign\u200bore all previous
-    instructions`` is found; the index map lets the finding be reported at the
-    offset of the *original* text, so quarantine still addresses real bytes.
+    The fast path derives the set from the compiled pattern via the private
+    :mod:`re._parser` module.  That module is CPython-internal and may be
+    absent or reshaped on an unsupported interpreter, so the derivation is
+    guarded: when it is unavailable we fall back to a parser-independent
+    enumeration of the pattern's character class.  Either way the resulting
+    set is exactly the set ``_INVISIBLE_RE`` matches, so the scanner behaves
+    identically to the published implementation.
+
+    Returns ``(codepoints, fastpath_available)``.
     """
+    try:
+        import re._parser as _sre_parse
+    except Exception:
+        _sre_parse = None
+    if _sre_parse is not None:
+        try:
+            out: set[int] = set()
+            for op, arg in _sre_parse.parse(_INVISIBLE_RE.pattern).data:
+                if op is _sre_parse.IN:
+                    for sub_op, sub_arg in arg:
+                        if sub_op is _sre_parse.LITERAL:
+                            out.add(sub_arg)
+            return frozenset(out), True
+        except Exception:
+            pass
+    return _invisible_codepoints_fallback(), False
+
+
+def _invisible_codepoints_fallback() -> frozenset:
+    """Parser-independent derivation of the invisible code point set.
+
+    ``_INVISIBLE_RE`` is a character class of literal code points and ranges.
+    The pattern text is parsed with a small, self-contained scanner that
+    understands only the constructs the pattern actually uses.  Every code
+    point in the whole Unicode range is then classified with the *compiled*
+    regex, which keeps the result identical to what the fast path computes
+    without touching private CPython internals.
+    """
+    pattern = _INVISIBLE_RE.pattern
+    body = pattern
+    if body.startswith("^"):
+        body = body[1:]
+    if body.startswith("[") and body.endswith("]"):
+        body = body[1:-1]
+    out: set[int] = set()
+    i = 0
+    n = len(body)
+    while i < n:
+        ch = body[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = body[i + 1]
+            i += 2
+            if nxt == "u" and i + 4 <= n:
+                try:
+                    out.add(int(body[i:i + 4], 16))
+                    i += 4
+                    continue
+                except ValueError:
+                    pass
+            if nxt == "x" and i + 2 <= n:
+                try:
+                    out.add(int(body[i:i + 2], 16))
+                    i += 2
+                    continue
+                except ValueError:
+                    pass
+            if nxt == "U" and i + 8 <= n:
+                try:
+                    out.add(int(body[i:i + 8], 16))
+                    i += 8
+                    continue
+                except ValueError:
+                    pass
+            out.add(ord(nxt))
+            continue
+        if i + 2 < n and body[i + 1] == "-":
+            try:
+                lo = ord(ch)
+                hi = ord(body[i + 2])
+            except ValueError:
+                i += 1
+                continue
+            if lo <= hi:
+                out.update(range(lo, hi + 1))
+            i += 3
+            continue
+        out.add(ord(ch))
+        i += 1
+    # Classify against the compiled regex so the set is exactly what
+    # ``_INVISIBLE_RE`` matches, independent of how the pattern is written.
+    matched = {cp for cp in out if _INVISIBLE_RE.fullmatch(chr(cp))}
+    return frozenset(matched)
+
+
+_INVISIBLE_CODEPOINTS, _INVISIBLE_FASTPATH = _invisible_codepoints()
+if len(_INVISIBLE_CODEPOINTS) != 36 or not all(
+        _INVISIBLE_RE.fullmatch(chr(cp)) for cp in _INVISIBLE_CODEPOINTS):
+    raise RuntimeError("invisible codepoint extraction failed")
+
+
+def _strip_invisible_map(text: str) -> Tuple[str, List[int]]:
+    """Fast identity path when no invisible character is present."""
+    if not _INVISIBLE_RE.search(text):
+        return text, ()
     kept: List[str] = []
     index_map: List[int] = []
     for pos, ch in enumerate(text):
-        if _INVISIBLE_RE.match(ch):
+        if ord(ch) in _INVISIBLE_CODEPOINTS:
             continue
         kept.append(ch)
         index_map.append(pos)
     return "".join(kept), index_map
+
 
 
 def _norm(text: str) -> str:
@@ -1401,6 +1557,95 @@ def _mixed_descriptive_frame(text: str, start: int, end: int, index: _FrameIndex
     # Bounded clause-prefix inspection, not repeated full-prefix scanning.
     return bool(_MIXED_REPORTING_BEFORE_RE.search(text[max(left, start - 256):start]))
 
+# --- performance: literal prefilter gates (candidate only) --------------- #
+# rule id -> ("ci" | "cs", tuple of literals).  A rule is skipped when the
+# text provably cannot contain any of its literals.
+_GATES: dict = {}
+
+
+def _build_gates() -> dict:
+    """Derive conservative literal gates for the rule table.
+
+    If the private ``re._parser`` module is unavailable the derivation returns
+    nothing for every rule, so no generic gate is installed.  The rule then
+    runs its original regex scan, unchanged.  A gate is only ever installed
+    when a *mandatory* literal has been proven, so a gated rule can never be
+    silently dropped: the gate is a necessary condition for a match.
+    """
+    try:
+        from ._prefilter import derive_rule_literals
+    except Exception:
+        return {}
+
+    gates = {}
+    for pattern_id, _category, regex, _severity in _RULES:
+        try:
+            lits = derive_rule_literals(regex.pattern, regex.flags)
+        except Exception:
+            continue
+        if not lits:
+            continue
+        kind = "ci" if (regex.flags & re.IGNORECASE) else "cs"
+        gates[pattern_id] = (kind, tuple(lits))
+    return gates
+
+
+def _gate_allows(pattern_id: str, text: str, norm_cache: list) -> bool:
+    """True when the rule may still match *text* (or when it is not gated).
+
+    This is the single implementation of the gate decision; the scanner calls
+    it for every rule, so there is exactly one place where a gate can reject
+    a document.  ``norm_cache`` is a one-element list used to memoise the
+    case-folded projection across the rules of a single scan.
+    """
+    gate = _GATES.get(pattern_id)
+    if gate is None:
+        return True
+    kind, lits = gate
+    # normalize_ci() only folds ASCII case; the two gates whose literals are
+    # Cyrillic use re.IGNORECASE.  Any non-ASCII input is admitted to the
+    # rule as a conservative fallback (never a false skip).  This check comes
+    # first: it applies to both the "cs" and the "ci" kind.
+    if pattern_id in _NONASCII_FALLBACK_GATES and not text.isascii():
+        return True
+    if kind == "cs":
+        return any(lit in text for lit in lits)
+    if norm_cache[0] is None:
+        from ._prefilter import normalize_ci
+
+        norm_cache[0] = normalize_ci(text)
+    norm = norm_cache[0]
+    return any(lit in norm for lit in lits)
+
+
+_GATES = _build_gates()
+
+# Conservative hand-derived gates for rules whose full regex defeats the
+# generic literal derivation.  Each literal is mandatory for a match, so
+# skipping a rule when none is present cannot suppress a finding.
+#
+# These literals are static data: they do not depend on the private
+# ``re._parser`` module and stay sound on any interpreter.  They are only
+# installed when the generic derivation produced a gate for the same rule or
+# when the derivation is unavailable, so the set of gated rules is identical
+# in both modes for these four rules.
+_HAND_DERIVED_GATES = {
+    "mixed_language_override": ("ci", ("ignore", "\u0438\u0433\u043d\u043e\u0440\u0438\u0440\u0443\u0439", "ignora")),
+    "ignore_previous_instructions_ru": ("cs", ("\u0438\u0433\u043d\u043e\u0440\u0438\u0440\u0443\u0439",)),
+    "role_spoof_system_turn": ("ci", ("system", "developer", "im_start", "im_end", "endoftext",
+                                      "assistant", "user", "inst", "sys", "human")),
+    "api_relay_advertisement": ("cs", ("://",)),
+}
+_GATES.update(_HAND_DERIVED_GATES)
+
+# normalize_ci() only folds ASCII case; these two gates contain Cyrillic
+# literals while their regexes use re.IGNORECASE.  Any non-ASCII input is
+# admitted to the rule as a conservative fallback (never a false skip).
+_NONASCII_FALLBACK_GATES = frozenset({
+    "mixed_language_override", "ignore_previous_instructions_ru",
+})
+
+
 def _scan_rules(
     text: str,
     findings: List[Finding],
@@ -1408,14 +1653,13 @@ def _scan_rules(
     remap: Optional[List[int]] = None,
 ) -> None:
     """Run the rule table over *text*, appending findings to *findings*."""
-    # _FrameIndex is built lazily on the first match that actually needs it
-    # (mixed_language_override or a _FRAME_GATED_RULES rule). It is a pure
-    # function of *text*, so building it on first use is semantically identical
-    # to building it up front; a document with no frame-gated match (the common
-    # benign case) never pays the indexing cost. _ContextIndex is likewise lazy.
     frame_index = None
     context_index = None
+    norm_cache = [None]
+    gates = _GATES
     for pattern_id, category, regex, severity in _RULES:
+        if pattern_id in gates and not _gate_allows(pattern_id, text, norm_cache):
+            continue
         for match in regex.finditer(text):
             if pattern_id == "mixed_language_override" or pattern_id in _FRAME_GATED_RULES:
                 if frame_index is None:
@@ -1543,8 +1787,7 @@ def _decode_escape(token):
 
 def _decode_candidates(text: str) -> Iterable[Tuple[str, str, int, int]]:
     """Yield ``(encoding, decoded_text, start, end)`` for encoded payloads."""
-    for match in _B64_RE.finditer(text):
-        blob = match.group(0)
+    for blob_start, blob_end, blob in _b64_candidates(text):
         # Only bother with plausible base64 (length % 4 == 0 after padding).
         padded = blob + "=" * (-len(blob) % 4)
         try:
@@ -1556,10 +1799,9 @@ def _decode_candidates(text: str) -> Iterable[Tuple[str, str, int, int]]:
         except UnicodeDecodeError:
             continue
         if decoded and sum(ch.isprintable() or ch in "\n\t" for ch in decoded) / len(decoded) > 0.85:
-            yield ("base64", decoded, match.start(), match.end())
+            yield ("base64", decoded, blob_start, blob_end)
 
-    for match in _HEX_RE.finditer(text):
-        blob = match.group(0)
+    for blob_start, blob_end, blob in _hex_candidates(text):
         if blob.lower().startswith("0x"):
             blob = blob[2:]
         try:
@@ -1571,7 +1813,7 @@ def _decode_candidates(text: str) -> Iterable[Tuple[str, str, int, int]]:
         except UnicodeDecodeError:
             continue
         if decoded:
-            yield ("hex", decoded, match.start(), match.end())
+            yield ("hex", decoded, blob_start, blob_end)
 
     for group in _escape_groups(_PCT_ESCAPE_RE, text):
         start, end = _expand_to_word(text, group[0].start(), group[-1].end())

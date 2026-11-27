@@ -80,6 +80,16 @@ class NativeIntegrationTest(unittest.TestCase):
         cls.loaded = {p["name"]: p for p in get_plugin_manager().list_plugins()}
         # Mode routing (PROMPT_FIREWALL_MODE) decides the suffix; ask the
         # plugin itself so the assertion follows the documented contract.
+        #
+        # ``pfplugin_under_test`` is registered by ``pf_loader``.  Importing
+        # it here makes this module runnable on its own: without this the
+        # module only worked when a sibling test module had already
+        # imported ``pf_loader`` first.
+        if str(Path(__file__).resolve().parent) not in sys.path:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import pf_loader  # noqa: E402
+
+        pf_loader.load_package()
         from pfplugin_under_test import _audit_path
         cls.audit_log = Path(_audit_path())
 

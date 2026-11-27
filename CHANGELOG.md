@@ -1,5 +1,44 @@
 # Changelog — prompt-firewall
 
+## 1.1.9 (plugin-only release candidate, 2026-11-27)
+
+Plugin-only **performance** update of the deterministic firewall. Baseline: published v1.1.8. No Core, OS-trust, catalog or Marketplace changes are part of this release, and nothing has been pushed, published or deployed.
+
+This release changes **only the scanner**. The action policy (`policy.py`), the grant model (`grants.py`), the hook modules and every other runtime module are byte-identical to published v1.1.8.
+
+### Fixed
+- **Unicode `IGNORECASE` fallback for the Cyrillic gates.** The `mixed_language_override` and `ignore_previous_instructions_ru` rules use `re.IGNORECASE`, but the case-folding projection used by the fast path folds ASCII only. A non-ASCII document is now admitted to those two rules conservatively, so an upper-cased Cyrillic phrase is still detected.
+- **Missing role alternative.** The `role_spoof_system_turn` rule now accepts the `endoftext` role marker.
+- **Hex decoder prefix.** The hex decoder strips an optional `0x` prefix before decoding.
+- **Private `re._parser` dependency.** The candidate used the private CPython module `re._parser` to derive literal gates. That module is an implementation detail and may be absent or reshaped. Its use is now guarded: when it is unavailable the affected gates are **disabled** and the **original regex scan runs instead** — no rule is silently skipped. The parser-independent fallback derives exactly the same invisible-character set, so findings and their offsets are unchanged. `tests/test_prefilter_fallback.py` proves the fallback by re-importing the package with `re._parser` hidden and comparing the finding sets.
+
+### Added
+- `_prefilter.py`: conservative literal-gate derivation. A gate is only installed when a *mandatory* literal has been proven, so a gated rule can never be silently dropped.
+- Permanent release tests: `tests/test_invisible_contract.py`, `tests/test_gate_contract.py`, `tests/test_security_controls.py`, `tests/test_prefilter_fallback.py`.
+- Lazy invisible-character normalisation: a document with no invisible character is returned unchanged, with no index map materialised.
+- Byte-level candidate scan for long base64 and hex runs, replacing two regex scans.
+
+### Changed
+- `detectors.py` only. `policy.py`, `grants.py`, `strings.py`, `explain.py`, `executable_view.py`, `action_context.py`, `pf_locale.py` and `__init__.py` are unchanged apart from the version constant.
+- `tests/test_native_integration.py` now imports `pf_loader` itself, so the module is runnable on its own. Previously it only worked when a sibling test module had imported `pf_loader` first.
+
+### Excluded
+- The frozen PF119 symbolic research is **not** part of this release: it is absent from the shipped tree, is not imported by any runtime module, and no part of it is claimed as a shipped feature.
+- OS-backed monotonic trust, same-UID isolation, rollback guarantees and native Core enforcement are not claimed or implemented by this release.
+- No new ALLOW is introduced by the scanner change: the action policy is untouched.
+
+### Verification
+- Full public retained suite under a compatible Hermes Core: **319 passed** (298 published + 21 new).
+- Public retained suite without Hermes Core (`hermes_cli` not importable): **305 passed**; 14 Core-dependent cases cannot run (13 error at setup, 1 fails).
+- Native integration through Hermes Core's own plugin discovery and hook dispatcher (`invoke_hook`): **13 passed**, Core `0bf92a126102d274ff2d6a839cf8b83ab75ac3d0`.
+- Differential against published v1.1.8 over 20 control and benign cells: **0 parity mismatches**; 13 required security detections all fire and 5 benign controls stay clean.
+- Full B2 benchmark on the original archived corpus: 11 result cells and 10 B1 action cells, 300 measured samples each, fixed CPU affinity, one child process per variant, raw samples archived. See the release dossier for the measured p50/p95/p99/max and the actual chars/s.
+
+### Limitations
+- Parity is bounded by the corpus. It is **not** a proof of all-input equivalence.
+- The 20 ms p95 budget is a property of the scanned corpus, not a universal latency bound: large finding-bearing documents remain slower than benign ones.
+- The published tree's "22 files / 23 tree entries" description in README.md is superseded by the file list in the release dossier for 1.1.9.
+
 ## 1.1.8 (plugin-only release candidate, 2026-11-24)
 
 Plugin-only update of the deterministic firewall. Baseline: published v1.1.7. No Core, OS-trust or Marketplace changes are part of this release.
