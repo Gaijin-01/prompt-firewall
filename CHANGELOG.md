@@ -1,6 +1,6 @@
 # Changelog — prompt-firewall
 
-## 1.1.9 (plugin-only release candidate, 2026-11-27)
+## 1.1.9 (plugin-only release, 2026-11-27)
 
 Plugin-only **performance** update of the deterministic firewall. Baseline: published v1.1.8. No Core, OS-trust, catalog or Marketplace changes are part of this release, and nothing has been pushed, published or deployed.
 
@@ -24,7 +24,7 @@ This release changes the scanner **and** the action path. Within the tested corp
   - `policy.py` — `_shell_tokenize`, `_shell_write_destinations` and `executable_command_view` are memoized on their exact inputs; `normalize_path`, the bounded argument walk and the active Hermes home are resolved once per policy evaluation.
   The shell-tokenization memo is evaluation-local as well: raw command strings are not retained after evaluation and concurrent eviction cannot race.
   - `executable_view.py` — `executable_command_view` is memoized on the exact `(source, tool_name)` pair.
-  - Every memo is scoped to a single evaluation (or a bounded cache keyed on the exact input), so a later evaluation always re-reads the filesystem and can never act on a stale resolution.
+  - Every memo is scoped to a single evaluation. This removes the observed inter-evaluation stale-resolution and cross-evaluation contamination defects; it does not provide a filesystem snapshot or eliminate TOCTOU changes inside one evaluation.
 - `detectors.py` and `_prefilter.py` — the **frozen scanner**, byte-identical to the frozen Track B variant E checkpoint `fdd518226633eadcd0be3a1369b2e89e9efde562`.
 - `grants.py`, `strings.py`, `explain.py`, `action_context.py` and `pf_locale.py` are unchanged.
 - `tests/test_native_integration.py` now imports `pf_loader` itself, so the module is runnable on its own. Previously it only worked when a sibling test module had imported `pf_loader` first.
@@ -32,7 +32,7 @@ This release changes the scanner **and** the action path. Within the tested corp
 ### Excluded
 - The frozen PF119 symbolic research is **not** part of this release: it is absent from the shipped tree, is not imported by any runtime module, and no part of it is claimed as a shipped feature.
 - OS-backed monotonic trust, same-UID isolation, rollback guarantees and native Core enforcement are not claimed or implemented by this release.
-- **No new ALLOW is introduced.** The action-path work removes redundant computation only; the findings, coordinates, quarantine spans, withheld content and reason codes are unchanged, and the candidate ALLOWs nothing that 1.1.7 does not ALLOW.
+- **Bounded security result.** On the tested security corpus, the corrected oracle reports zero new ALLOW decisions relative to the pinned baselines. This is not a universal all-input guarantee.
 
 ### Fixed (release-lane follow-up, not part of the frozen scanner checkpoint)
 - **Throughput accounting in the release benchmark runner.** The runner divided the one-pass corpus size by the summed wall time of *all* repetitions, under-reporting throughput by a factor of `reps` (300x for the release runs). The numerator is now `chars x reps`, and the pooled path uses `sum(cell_chars x cell_reps)`. The full benchmark was re-run from scratch and every derived artefact regenerated. The formula is pinned by `bench/test_throughput_accounting.py`. The frozen scanner checkpoint is unaffected: no runtime module changed.

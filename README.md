@@ -2,7 +2,9 @@
 
 A deterministic prompt-injection firewall for [Hermes Agent](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins).
 
-Version **1.1.9** is a plugin-only **performance** release candidate. It is not published to the catalog yet; the catalog currently points at an earlier release. Production installations remain on the previously published version until a maintainer-reviewed catalog pull request moves the published pin. Nothing in this tree has been pushed, published or deployed.
+Version **1.1.9** is a plugin-only **Performance & Isolation Update**. The catalog pin is maintained through a maintainer-reviewed pull request; production installations remain on the previously published version until that pin changes.
+
+**Operator guide:** [`OPERATOR_HELPER.md`](OPERATOR_HELPER.md) — installation, verification, grants, diagnostics, rollback and safe issue reporting.
 
 ## What changed in 1.1.9
 
@@ -14,7 +16,7 @@ This is a **Performance & Isolation Update** covering both tool-output scanning 
 - **Compatibility fallback.** When CPython's private `re._parser` is unavailable, the original regex scan runs instead; fallback parity is verified over 23 controls.
 - **Security fixes carried from the frozen scanner checkpoint.** Cyrillic `IGNORECASE` handling, the `endoftext` role alternative, and optional `0x` hex prefixes.
 
-The public candidate contains **30 tracked files**: 17 runtime/support and public-document files plus **13 retained test files**. Its runtime modules include `policy.py`, `executable_view.py` and `_eval_context.py`; they are not byte-identical to published v1.1.8. The frozen scanner files `detectors.py` and `_prefilter.py` remain byte-identical to the accepted scanner checkpoint.
+The public candidate contains **31 tracked files**: 18 runtime/support and public-document files plus **13 retained test files**. Its runtime modules include `policy.py`, `executable_view.py` and `_eval_context.py`; they are not byte-identical to published v1.1.8. The frozen scanner files `detectors.py` and `_prefilter.py` remain byte-identical to the accepted scanner checkpoint.
 
 The 1.1.8 baseline is preserved as published history. The frozen PF119 symbolic research and the experimental Durable Ledger developed alongside this line are **not part of this plugin**: both are absent from the shipped tree and are not imported by any runtime module. No OS-backed monotonic trust, same-UID isolation, D12 rollback guarantee, native Core enforcement or external adversarial evaluation is claimed by this release.
 
@@ -148,7 +150,7 @@ Only metadata is recorded - reason code, source label, pattern ids. File content
 
 ## Evidence and verification status
 
-The public tree contains **30 tracked files**: 17 runtime/support and public-document files plus **13 retained test files**. Audit logs, benchmark corpora, vendored Core test dependencies and research artifacts are not in the public tree; they live in a separate private audit package.
+The public tree contains **31 tracked files**: 18 runtime/support and public-document files plus **13 retained test files**. Audit logs, benchmark corpora, vendored Core test dependencies and research artifacts are not in the public tree; they live in a separate private audit package.
 
 Verification has three distinct scopes. Do not conflate them:
 
@@ -162,10 +164,14 @@ Reproduce the public results:
 
 ```bash
 # with Hermes Core available on PYTHONPATH
-cd tests && python3 -m pytest -q . -p no:cacheprovider
+cd tests
+python3 -m pytest . -p no:cacheprovider
 
-# without Hermes Core (14 Core-dependent cases cannot run: hermes_cli is absent)
-cd tests && python3 -m pytest -q . -p no:cacheprovider
+# without Hermes Core: exclude the 13 native-integration tests and the one
+# Core-dispatch regression test
+python3 -m pytest . --ignore=test_native_integration.py \
+  -k 'not audit_protected_write_escalation_is_enforced_by_core_dispatch' \
+  -p no:cacheprovider
 ```
 
 Run the suite from inside `tests/`. The plugin root's `__init__.py` is a package marker, not a test module; running pytest with the plugin directory as the collection root makes pytest try to import it as a test module and fail with `ImportError: attempted relative import with no known parent package`.
