@@ -14,7 +14,7 @@ This is a **Performance & Isolation Update** covering both tool-output scanning 
 - **Compatibility fallback.** When CPython's private `re._parser` is unavailable, the original regex scan runs instead; fallback parity is verified over 23 controls.
 - **Security fixes carried from the frozen scanner checkpoint.** Cyrillic `IGNORECASE` handling, the `endoftext` role alternative, and optional `0x` hex prefixes.
 
-The public candidate contains **30 tracked files**: 13 runtime/support files, 3 public documents/manifest files, and 14 retained test files. Its runtime modules include `policy.py`, `executable_view.py` and `_eval_context.py`; they are not byte-identical to published v1.1.8. The frozen scanner files `detectors.py` and `_prefilter.py` remain byte-identical to the accepted scanner checkpoint.
+The public candidate contains **30 tracked files**: 17 runtime/support and public-document files plus **13 retained test files**. Its runtime modules include `policy.py`, `executable_view.py` and `_eval_context.py`; they are not byte-identical to published v1.1.8. The frozen scanner files `detectors.py` and `_prefilter.py` remain byte-identical to the accepted scanner checkpoint.
 
 The 1.1.8 baseline is preserved as published history. The frozen PF119 symbolic research and the experimental Durable Ledger developed alongside this line are **not part of this plugin**: both are absent from the shipped tree and are not imported by any runtime module. No OS-backed monotonic trust, same-UID isolation, D12 rollback guarantee, native Core enforcement or external adversarial evaluation is claimed by this release.
 
