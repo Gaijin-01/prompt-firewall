@@ -2065,6 +2065,28 @@ def _resolve_relative(path: str, cwd: Optional[str]) -> Tuple[str, bool]:
     return path, False
 
 
+#: Bounded memo of shell write-destination analyses.
+#:
+#: ``_shell_write_destinations`` is a *pure* function of
+#: ``(command, depth, cwd)``: it reads no mutable module state, no clock
+#: and no environment, and its only side effect is appending to the
+#: caller's ``unresolved`` list.  The B1 action path analyses the same
+#: command twice per tool call -- once through
+#: ``extract_exec_write_destinations`` (which keeps the resolved
+#: destinations) and once through ``extract_unresolved_write_destinations``
+#: (which keeps the unresolved ones) -- and each of the two discards half
+#: of the other's result.  Memoizing the analysis therefore removes
+#: redundant work, not work: both callers receive exactly the lists the
+#: uncached implementation would have produced.
+#:
+#: The cache is bounded so a long-lived process cannot grow it without
+#: limit, and it is keyed on the exact ``(command, depth, cwd)`` triple.
+_SHELL_WRITE_MEMO: Dict[Tuple[str, int, Optional[str]], Tuple[List[str], List[str]]] = {}
+
+#: Maximum number of memoized analyses kept at once.
+_SHELL_WRITE_MEMO_MAX = 512
+
+
 def _shell_write_destinations(
     command: str, depth: int = 0, cwd: Optional[str] = None,
     unresolved: Optional[List[str]] = None,
@@ -2077,6 +2099,36 @@ def _shell_write_destinations(
     ``unresolved``, when provided, receives every destination whose resolution
     state is False so the policy can apply fail-closed treatment explicitly
     instead of silently relying on a bare relative path (R04).
+
+    Memoized: see ``_SHELL_WRITE_MEMO``.  The returned list is shared
+    between callers, so a caller MUST NOT mutate it; every caller in this
+    module only reads it or extends a copy of it.
+    """
+    key = (command, depth, cwd)
+    cached = _SHELL_WRITE_MEMO.get(key)
+    if cached is None:
+        collected_unresolved: List[str] = []
+        destinations = _shell_write_destinations_uncached(
+            command, depth, cwd, collected_unresolved)
+        cached = (destinations, collected_unresolved)
+        if len(_SHELL_WRITE_MEMO) >= _SHELL_WRITE_MEMO_MAX:
+            # Bounded: drop the oldest inserted entry.
+            del _SHELL_WRITE_MEMO[next(iter(_SHELL_WRITE_MEMO))]
+        _SHELL_WRITE_MEMO[key] = cached
+    destinations, memo_unresolved = cached
+    if unresolved is not None:
+        unresolved.extend(memo_unresolved)
+    return destinations
+
+
+def _shell_write_destinations_uncached(
+    command: str, depth: int = 0, cwd: Optional[str] = None,
+    unresolved: Optional[List[str]] = None,
+) -> List[str]:
+    """The files a shell command writes to, when statically resolvable.
+
+    The uncached implementation behind the memoizing ``_shell_write_destinations``
+    wrapper.  See that function for the contract.
     """
     tokens = _shell_tokenize(command)
     if not tokens:
