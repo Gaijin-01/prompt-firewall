@@ -42,6 +42,7 @@ from __future__ import annotations
 from .action_context import (  # type: ignore[import-not-found]
     ActionContext, ActionAuthorization, SourceProvenance,
 )
+from ._eval_context import bind_eval_state, eval_state, reset_eval_state
 from .executable_view import executable_command_view
 
 import hashlib
@@ -530,7 +531,7 @@ _PROTECTED_PATH_MARKERS: Tuple[str, ...] = (
 #: installed by ``_normalize_path_memo_scope`` and removed again in a
 #: ``finally``, so a later evaluation always re-reads the filesystem and
 #: can never act on a stale resolution.
-_NORMALIZE_PATH_MEMO: Optional[Dict[Tuple[str, Optional[str]], str]] = None
+# Cache state lives in _eval_context (ContextVar), never in a module global.
 
 
 def normalize_path(raw: str, cwd: Optional[str] = None) -> str:
@@ -547,20 +548,18 @@ def normalize_path(raw: str, cwd: Optional[str] = None) -> str:
 
     Inside a ``_normalize_path_memo_scope`` block the resolution is
     memoized for the duration of one policy evaluation; see
-    ``_NORMALIZE_PATH_MEMO``.
+    the evaluation-local cache in ``_eval_context``.
     """
     if not isinstance(raw, str) or not raw:
         return ""
-    memo = _NORMALIZE_PATH_MEMO
-    if memo is not None:
-        key = (raw, cwd)
-        cached = memo.get(key)
-        if cached is not None:
-            return cached
-        result = _normalize_path_uncached(raw, cwd)
-        memo[key] = result
-        return result
-    return _normalize_path_uncached(raw, cwd)
+    memo = eval_state().setdefault("normalize_path", {})
+    key = (raw, cwd)
+    cached = memo.get(key)
+    if cached is not None:
+        return cached
+    result = _normalize_path_uncached(raw, cwd)
+    memo[key] = result
+    return result
 
 
 def _has_surrogate(text: str) -> bool:
@@ -710,13 +709,13 @@ def dispatch_decision(*, veto_reason=None, veto_detail=None, unresolved_reason=N
 #: judged, so it is resolved once per evaluation.  The memo lives for
 #: exactly ONE policy evaluation; outside one the home is resolved on
 #: every call, exactly as before.
-_ACTIVE_HERMES_HOME_MEMO: Optional[str] = None
+# Cache state lives in _eval_context (ContextVar), never in a module global.
 
 
 def _active_hermes_home() -> str:
     """The Hermes home the running agent actually uses (never raises)."""
-    global _ACTIVE_HERMES_HOME_MEMO
-    memo = _ACTIVE_HERMES_HOME_MEMO
+    state = eval_state()
+    memo = state.get("active_hermes_home")
     if memo is not None:
         return memo
     home_path = ""
@@ -730,7 +729,7 @@ def _active_hermes_home() -> str:
         pass
     if not home_path:
         home_path = os.path.join(_home(), ".hermes")
-    _ACTIVE_HERMES_HOME_MEMO = home_path
+    state["active_hermes_home"] = home_path
     return home_path
 
 
@@ -1456,7 +1455,7 @@ def _arg_scan_complete(args: Any) -> bool:
 #: mapping, so two different mappings never share an entry.  Outside an
 #: evaluation the memo is absent and the walk happens on every call,
 #: exactly as before.
-_ARG_STRINGS_MEMO: Optional[Tuple[Any, str, bool]] = None
+# Cache state lives in _eval_context (ContextVar), never in a module global.
 
 
 def _arg_strings_once(args: Any) -> Tuple[str, bool]:
@@ -1465,14 +1464,14 @@ def _arg_strings_once(args: Any) -> Tuple[str, bool]:
     Inside a policy evaluation the result is memoized, so the argument
     tree is walked once instead of once per consumer.
     """
-    global _ARG_STRINGS_MEMO
-    memo = _ARG_STRINGS_MEMO
+    state = eval_state()
+    memo = state.get("arg_strings")
     if memo is not None:
         cached_args, text, complete = memo
         if cached_args is args:
             return text, complete
     result = _bounded_arg_strings(args)
-    _ARG_STRINGS_MEMO = (args, result[0], result[1])
+    state["arg_strings"] = (args, result[0], result[1])
     return result
 
 
@@ -2222,10 +2221,7 @@ def _resolve_relative(path: str, cwd: Optional[str]) -> Tuple[str, bool]:
 #:
 #: The cache is bounded so a long-lived process cannot grow it without
 #: limit, and it is keyed on the exact ``(command, depth, cwd)`` triple.
-_SHELL_WRITE_MEMO: Dict[Tuple[str, int, Optional[str]], Tuple[List[str], List[str]]] = {}
-
-#: Maximum number of memoized analyses kept at once.
-_SHELL_WRITE_MEMO_MAX = 512
+# Cache state lives in _eval_context (ContextVar), never in a module global.
 
 
 def _shell_write_destinations(
@@ -2241,21 +2237,25 @@ def _shell_write_destinations(
     state is False so the policy can apply fail-closed treatment explicitly
     instead of silently relying on a bare relative path (R04).
 
-    Memoized: see ``_SHELL_WRITE_MEMO``.  The returned list is shared
-    between callers, so a caller MUST NOT mutate it; every caller in this
-    module only reads it or extends a copy of it.
+    Memoized only for the duration of one evaluation: see ``_eval_context``.
+    The returned list is shared between callers within that evaluation, so a
+    caller MUST NOT mutate it; every caller in this module only reads it or
+    extends a copy of it.
     """
+    # Evaluation-local only: _cd_target/_resolve_relative call expanduser(),
+    # so a command's destinations are a function of the ENVIRONMENT as well as
+    # (command, depth, cwd).  A process-global cache can survive a HOME change
+    # and return a stale protected path.  One evaluation cannot see a HOME
+    # change, so a per-evaluation memo is sound; outside one there is no cache.
+    memo = eval_state().setdefault("shell_write", {})
     key = (command, depth, cwd)
-    cached = _SHELL_WRITE_MEMO.get(key)
+    cached = memo.get(key)
     if cached is None:
         collected_unresolved: List[str] = []
         destinations = _shell_write_destinations_uncached(
             command, depth, cwd, collected_unresolved)
         cached = (destinations, collected_unresolved)
-        if len(_SHELL_WRITE_MEMO) >= _SHELL_WRITE_MEMO_MAX:
-            # Bounded: drop the oldest inserted entry.
-            del _SHELL_WRITE_MEMO[next(iter(_SHELL_WRITE_MEMO))]
-        _SHELL_WRITE_MEMO[key] = cached
+        memo[key] = cached
     destinations, memo_unresolved = cached
     if unresolved is not None:
         unresolved.extend(memo_unresolved)
@@ -3754,20 +3754,12 @@ def evaluate_tool_call(
     is removed again before this function returns, so a later evaluation
     always re-reads the filesystem.
     """
-    global _NORMALIZE_PATH_MEMO, _ARG_STRINGS_MEMO, _ACTIVE_HERMES_HOME_MEMO
-    previous = _NORMALIZE_PATH_MEMO
-    previous_args = _ARG_STRINGS_MEMO
-    previous_home = _ACTIVE_HERMES_HOME_MEMO
-    _NORMALIZE_PATH_MEMO = {}
-    _ARG_STRINGS_MEMO = None
-    _ACTIVE_HERMES_HOME_MEMO = None
+    token = bind_eval_state()
     try:
         return _evaluate_tool_call(
             tool_name, args, grant=grant, cwd=cwd)
     finally:
-        _NORMALIZE_PATH_MEMO = previous
-        _ARG_STRINGS_MEMO = previous_args
-        _ACTIVE_HERMES_HOME_MEMO = previous_home
+        reset_eval_state(token)
 
 
 def _evaluate_tool_call(

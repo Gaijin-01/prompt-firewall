@@ -11,6 +11,8 @@ import shlex
 import tokenize
 from typing import Dict, Tuple
 
+from ._eval_context import eval_state
+
 
 def _python_executable_view(source: str) -> str:
     lines = list(source.splitlines())
@@ -103,30 +105,27 @@ def _shell_executable_view(source: str) -> str:
 #: The cache is bounded so a long-lived process cannot grow it without
 #: limit, and it is keyed on the exact ``(source, tool_name)`` pair, so
 #: two different inputs never share an entry.
-_EXECUTABLE_VIEW_MEMO: Dict[Tuple[str, str], str] = {}
-
-#: Maximum number of memoized views kept at once.
-_EXECUTABLE_VIEW_MEMO_MAX = 512
+# The view cache is evaluation-local.  A process-global cache would retain
+# arguments and could outlive the evaluation that produced it; see
+# ``_eval_context``.  Outside an evaluation nothing is retained.
 
 
 def executable_command_view(source: str, tool_name: str) -> str:
     """The executable projection of *source* for *tool_name*.
 
-    Memoized: see ``_EXECUTABLE_VIEW_MEMO``.  The returned string is
-    immutable, so sharing it between callers is safe.
+    Memoized only within one evaluation (see ``_eval_context``).  The returned
+    string is immutable, so sharing it within that evaluation is safe.
     """
     if not source:
         return source
+    memo = eval_state().setdefault("executable_view", {})
     key = (source, tool_name)
-    cached = _EXECUTABLE_VIEW_MEMO.get(key)
+    cached = memo.get(key)
     if cached is not None:
         return cached
     if tool_name in ("execute_code", "python"):
         view = _python_executable_view(source)
     else:
         view = _shell_executable_view(source)
-    if len(_EXECUTABLE_VIEW_MEMO) >= _EXECUTABLE_VIEW_MEMO_MAX:
-        # Bounded: drop the oldest inserted entry.
-        del _EXECUTABLE_VIEW_MEMO[next(iter(_EXECUTABLE_VIEW_MEMO))]
-    _EXECUTABLE_VIEW_MEMO[key] = view
+    memo[key] = view
     return view

@@ -153,7 +153,7 @@ Verification has three distinct scopes. Do not conflate them:
 | Scope | Prerequisites | Result |
 |---|---|---|
 | Complete pre-extraction candidate suite | Full source checkout with vendored Hermes Core test dependencies | 557 passed (historical, 1.1.8-era) |
-| Public retained suite, with Hermes Core | Public tree plus a Hermes Core checkout providing `hermes_cli` | **319 passed** for 1.1.9 (298 in 1.1.8 + 21 new) |
+| Public retained suite, with Hermes Core | Public tree plus a Hermes Core checkout providing `hermes_cli` | **337 passed** for 1.1.9 (298 in 1.1.8 + 21 new + 7 cache-isolation controls + 11 surrogate eq.) |
 | Public retained suite, without Hermes Core | Public tree only, `hermes_cli` not importable | **305 passed**; 14 Core-dependent cases cannot run (13 error at setup, 1 fails) |
 
 Reproduce the public results:
