@@ -4,11 +4,11 @@
 
 Plugin-only **performance** update of the deterministic firewall. Baseline: published v1.1.8. No Core, OS-trust, catalog or Marketplace changes are part of this release, and nothing has been pushed, published or deployed.
 
-This release changes the scanner **and** the action path. The scanner work is the frozen Track B variant E checkpoint; the action-path work removes redundant work from the `pre_tool_call` policy evaluation. Every security-relevant behaviour is unchanged: the findings, their coordinates, the quarantine spans, the withheld content and the reason codes are identical to the previous candidate, and **no new ALLOW** is introduced.
+This release changes the scanner **and** the action path. Within the tested corpus, findings, coordinates, quarantine spans, withheld content, reason codes and hook decisions match the published comparison candidate; this is bounded parity, not a claim of universal all-input equivalence. The corrected action oracle records zero new ALLOW decisions on the tested security corpus.
 
 ### Fixed
 - **Unicode `IGNORECASE` fallback for the Cyrillic gates.** The `mixed_language_override` and `ignore_previous_instructions_ru` rules use `re.IGNORECASE`, but the case-folding projection used by the fast path folds ASCII only. A non-ASCII document is now admitted to those two rules conservatively, so an upper-cased Cyrillic phrase is still detected.
-- **Missing role alternative.** The `role_spoof_system_turn` rule now accepts the `endtext` role marker.
+- **Missing role alternative.** The `role_spoof_system_turn` rule now accepts the `endoftext` role marker.
 - **Hex decoder prefix.** The hex decoder strips an optional `0x` prefix before decoding.
 - **Private `re._parser` dependency.** The candidate used the private CPython module `re._parser` to derive literal gates. That module is an implementation detail and may be absent or reshaped. Its use is now guarded: when it is unavailable the affected gates are **disabled** and the **original regex scan runs instead** — no rule is silently skipped. The parser-independent fallback derives exactly the same invisible-character set, so findings and their offsets are unchanged. `tests/test_prefilter_fallback.py` proves the fallback by re-importing the package with `re._parser` hidden and comparing the finding sets.
 

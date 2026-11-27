@@ -6,15 +6,17 @@ Version **1.1.9** is a plugin-only **performance** release candidate. It is not 
 
 ## What changed in 1.1.9
 
-This release changes **the scanner only**. `policy.py`, `grants.py`, `strings.py`, `explain.py`, `executable_view.py`, `action_context.py` and `pf_locale.py` are byte-identical to published v1.1.8, so the action boundary, the grant model and every hook signature are unchanged.
+This is a **Performance & Isolation Update** covering both tool-output scanning and action-policy evaluation. The scanner work is frozen at the accepted Track B variant E checkpoint; the action path is independently optimized and now uses evaluation-local cache state. The release does not claim universal semantic equivalence: behavioral parity is bounded by the tested corpus.
 
-- **Performance.** A conservative literal-gate prefilter skips a rule when the document provably cannot contain any of that rule's mandatory literals, and invisible-character normalisation takes an identity fast path on documents with no invisible character. On the original archived B2 corpus this brings the pooled p95 of `transform_tool_result` from roughly 309 ms down to the mid-teens of milliseconds.
-- **Three security fixes carried in from the frozen Track B checkpoint.** The Unicode `IGNORECASE` fallback for the two Cyrillic gates, the missing `endoftext` role alternative, and the optional `0x` prefix in the hex decoder.
-- **A guarded dependency on a private CPython module.** The gate derivation uses `re._parser`, which is a CPython implementation detail. It is now optional: on an interpreter where it is unavailable or reshaped, the affected gates are disabled and the original regex scan runs instead. No rule is silently skipped, and the parser-independent fallback derives exactly the same invisible-character set. `tests/test_prefilter_fallback.py` proves this by re-importing the package with `re._parser` hidden and comparing the finding sets.
-- **Permanent release tests.** `tests/test_invisible_contract.py`, `tests/test_gate_contract.py`, `tests/test_security_controls.py` and `tests/test_prefilter_fallback.py` are added to the tree. They are self-contained: no external corpus, no absolute path, no live Hermes.
-- **One test-portability fix.** `tests/test_native_integration.py` now imports `pf_loader` itself, so the module can be run on its own. Previously it only worked when a sibling test module had already imported `pf_loader`.
+- **Tool-output scanning.** Conservative literal-gate prefiltering, lazy invisible-character normalization, and faster hexadecimal/Base64 candidate extraction reduce the pooled `transform_tool_result` p95 on the locked corpus from **317.3259 ms** in published v1.1.8 to **17.8490 ms** in 1.1.9 (**17.7784×** faster; 94.38% lower p95 latency).
+- **Action-policy evaluation.** Shell tokenization, write-destination analysis, executable-view construction, path normalization, argument traversal and active Hermes-home resolution avoid redundant work. Final pooled `pre_tool_call` B1 p95 is **0.4027 ms** versus **0.5577 ms** in published v1.1.8.
+- **Evaluation-local isolation.** `_eval_context.py` provides a `ContextVar` state shared by `policy.py` and `executable_view.py`. Caches are fresh per evaluation, isolated across threads/tasks and nested calls, and reset on exceptions. Shell command strings are not retained after evaluation.
+- **Compatibility fallback.** When CPython's private `re._parser` is unavailable, the original regex scan runs instead; fallback parity is verified over 23 controls.
+- **Security fixes carried from the frozen scanner checkpoint.** Cyrillic `IGNORECASE` handling, the `endoftext` role alternative, and optional `0x` hex prefixes.
 
-The 1.1.8 baseline is preserved as published history. Version 1.1.9 does not rewrite or replace that history. The frozen PF119 symbolic research and the experimental Durable Ledger developed alongside this line are **not part of this plugin**: both are absent from the shipped tree and are not imported by any runtime module. No OS-backed monotonic trust, same-UID isolation, D12 rollback guarantee or native Core enforcement is claimed by this release.
+The public candidate contains **30 tracked files**: 13 runtime/support files, 3 public documents/manifest files, and 14 retained test files. Its runtime modules include `policy.py`, `executable_view.py` and `_eval_context.py`; they are not byte-identical to published v1.1.8. The frozen scanner files `detectors.py` and `_prefilter.py` remain byte-identical to the accepted scanner checkpoint.
+
+The 1.1.8 baseline is preserved as published history. The frozen PF119 symbolic research and the experimental Durable Ledger developed alongside this line are **not part of this plugin**: both are absent from the shipped tree and are not imported by any runtime module. No OS-backed monotonic trust, same-UID isolation, D12 rollback guarantee, native Core enforcement or external adversarial evaluation is claimed by this release.
 
 ## What changed in 1.1.8
 
@@ -146,7 +148,7 @@ Only metadata is recorded - reason code, source label, pattern ids. File content
 
 ## Evidence and verification status
 
-The public tree contains **27 files**: 16 runtime/document files plus **11 retained test files**. Git reports **28 tree entries** because `tests/` is itself counted as one tree entry. Audit logs, benchmark corpora, vendored Core test dependencies and research artifacts are not in the public tree; they live in a separate private audit package.
+The public tree contains **30 tracked files**: 17 runtime/support and public-document files plus **13 retained test files**. Audit logs, benchmark corpora, vendored Core test dependencies and research artifacts are not in the public tree; they live in a separate private audit package.
 
 Verification has three distinct scopes. Do not conflate them:
 
@@ -205,8 +207,7 @@ No release of this plugin provides complete protection. The following gaps are p
 
 ## Scope of the published tree
 
-The published tree contains 27 files (28 Git tree entries, counting the `tests/` directory): `plugin.yaml`, `__init__.py`, `_prefilter.py`, `action_context.py`, `detectors.py`, `executable_view.py`, `explain.py`, `grants.py`, `pf_locale.py`, `policy.py`, `strings.py`, `README.md`, `CHANGELOG.md`, `SECURITY_LIMITATIONS.md`, `LICENSE`, `.gitignore` and 11 retained regression files under `tests/`. Audit, benchmark and development-only files are not part of it; they live in a separate private audit package.
-
+The public tree contains 30 tracked files: 17 runtime/support and public-document files plus 13 retained regression files under `tests/`. Audit, benchmark and development-only files are not part of it; they live in a separate private audit package.
 ## Bounded shell semantics
 
 Shell writes are gated by a **static** resolver in `policy.py`: it reads the command text, decides where the write would land and compares that destination with the protected surfaces. It never executes the command. The boundaries below are part of the contract, not an implementation detail.
