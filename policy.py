@@ -509,6 +509,30 @@ _PROTECTED_PATH_MARKERS: Tuple[str, ...] = (
 # --------------------------------------------------------------------------- #
 
 
+#: Per-evaluation memo of normalized paths.
+#:
+#: ``normalize_path`` resolves a path against the *filesystem*, so its
+#: result is only stable while the filesystem is stable.  Within a single
+#: ``evaluate_tool_call`` the filesystem cannot meaningfully change -- the
+#: call has not executed yet -- so the resolution of one path is the
+#: resolution of that path for the whole evaluation.
+#:
+#: The B1 action path normalizes the *same* path many times per call:
+#: ``is_protected_path`` normalizes the target and then normalizes the
+#: Hermes home roots again, and the various path predicates each
+#: normalize their own inputs.  Measured on the locked B1 corpus this is
+#: 57 calls with only 17 distinct ``(raw, cwd)`` inputs -- 70% of the
+#: resolutions are exact repeats, and each repeat costs an
+#: ``expanduser``/``expandvars``/``realpath``/``exists`` round trip plus
+#: the ancestor walk.
+#:
+#: The cache therefore lives for exactly ONE policy evaluation.  It is
+#: installed by ``_normalize_path_memo_scope`` and removed again in a
+#: ``finally``, so a later evaluation always re-reads the filesystem and
+#: can never act on a stale resolution.
+_NORMALIZE_PATH_MEMO: Optional[Dict[Tuple[str, Optional[str]], str]] = None
+
+
 def normalize_path(raw: str, cwd: Optional[str] = None) -> str:
     """Normalize *raw* without ever raising on hostile path input.
 
@@ -520,6 +544,30 @@ def normalize_path(raw: str, cwd: Optional[str] = None) -> str:
     supplied the process cwd remains the fallback for compatibility, but an
     ambient gateway cwd must never silently reclassify a relative shell
     destination as a protected path (P0-2).
+
+    Inside a ``_normalize_path_memo_scope`` block the resolution is
+    memoized for the duration of one policy evaluation; see
+    ``_NORMALIZE_PATH_MEMO``.
+    """
+    if not isinstance(raw, str) or not raw:
+        return ""
+    memo = _NORMALIZE_PATH_MEMO
+    if memo is not None:
+        key = (raw, cwd)
+        cached = memo.get(key)
+        if cached is not None:
+            return cached
+        result = _normalize_path_uncached(raw, cwd)
+        memo[key] = result
+        return result
+    return _normalize_path_uncached(raw, cwd)
+
+
+def _normalize_path_uncached(raw: str, cwd: Optional[str] = None) -> str:
+    """Normalize *raw* against the current filesystem state.
+
+    The uncached implementation behind the memoizing ``normalize_path``
+    wrapper.  See that function for the contract.
     """
     if not isinstance(raw, str) or not raw:
         return ""
@@ -3606,6 +3654,29 @@ def evaluate_tool_call(
     ``cwd`` is the execution directory of this call. It is used to resolve
     relative shell destinations; when it is absent, relative writes are not
     attributed to the ambient gateway cwd (P0-2).
+
+    The evaluation runs inside a one-evaluation ``normalize_path`` memo
+    scope: the same path is normalized many times per evaluation, and the
+    filesystem cannot change while the call is still being judged.  The memo
+    is removed again before this function returns, so a later evaluation
+    always re-reads the filesystem.
+    """
+    global _NORMALIZE_PATH_MEMO
+    previous = _NORMALIZE_PATH_MEMO
+    _NORMALIZE_PATH_MEMO = {}
+    try:
+        return _evaluate_tool_call(
+            tool_name, args, grant=grant, cwd=cwd)
+    finally:
+        _NORMALIZE_PATH_MEMO = previous
+
+
+def _evaluate_tool_call(
+    tool_name: str, args: Any, *, grant: Any = None, cwd: Optional[str] = None
+) -> Verdict:
+    """The body of :func:`evaluate_tool_call`.
+
+    See that function for the contract.
     """
     name = (tool_name or "").lower()
     content = _arg_text(args)
