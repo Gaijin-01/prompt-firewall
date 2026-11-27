@@ -27,6 +27,9 @@ This release changes **only the scanner**. The action policy (`policy.py`), the 
 - OS-backed monotonic trust, same-UID isolation, rollback guarantees and native Core enforcement are not claimed or implemented by this release.
 - No new ALLOW is introduced by the scanner change: the action policy is untouched.
 
+### Fixed (release-lane follow-up, not part of the frozen scanner checkpoint)
+- **Throughput accounting in the release benchmark runner.** The runner divided the one-pass corpus size by the summed wall time of *all* repetitions, under-reporting throughput by a factor of `reps` (300x for the release runs). The numerator is now `chars x reps`, and the pooled path uses `sum(cell_chars x cell_reps)`. The full benchmark was re-run from scratch and every derived artefact regenerated. The formula is pinned by `bench/test_throughput_accounting.py`. The frozen scanner checkpoint is unaffected: no runtime module changed.
+
 ### Verification
 - Full public retained suite under a compatible Hermes Core: **319 passed** (298 published + 21 new).
 - Public retained suite without Hermes Core (`hermes_cli` not importable): **305 passed**; 14 Core-dependent cases cannot run (13 error at setup, 1 fails).
